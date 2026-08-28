@@ -1,0 +1,107 @@
+name: bootstrap
+
+run-name: bootstrap-${{ inputs.runner_name }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      runs_on:
+        description: Hosted runner label (e.g. ubuntu-latest, macos-15, windows-2022)
+        required: true
+        type: string
+      target_url:
+        description: Target repository URL
+        required: true
+        type: string
+      reg_token:
+        description: Runner registration token (one-time)
+        required: true
+        type: string
+      runner_name:
+        description: Runner name
+        required: true
+        type: string
+      runner_labels:
+        description: Comma-separated runner labels
+        required: true
+        type: string
+      runner_version:
+        description: actions/runner version
+        required: false
+        default: '2.336.0'
+        type: string
+
+jobs:
+  bootstrap:
+    runs-on: ${{ inputs.runs_on }}
+    permissions:
+      contents: read
+      actions: write
+    steps:
+      # 按 os/arch/version 缓存压缩包，命中后跳过 GitHub Releases 下载
+      - name: Restore runner package
+        id: cache
+        uses: actions/cache/restore@v4
+        with:
+          path: runner-pkg
+          key: runner-${{ runner.os }}-${{ runner.arch }}-${{ inputs.runner_version }}
+
+      - name: Download runner (Linux)
+        if: runner.os == 'Linux' && steps.cache.outputs.cache-hit != 'true'
+        run: |
+          ARCH=x64
+          [ "${{ runner.arch }}" = "ARM64" ] && ARCH=arm64
+          mkdir -p runner-pkg
+          curl -o runner-pkg/actions-runner.tar.gz -L \
+            https://github.com/actions/runner/releases/download/v${{ inputs.runner_version }}/actions-runner-linux-${ARCH}-${{ inputs.runner_version }}.tar.gz
+
+      - name: Download runner (macOS)
+        if: runner.os == 'macOS' && steps.cache.outputs.cache-hit != 'true'
+        run: |
+          ARCH=x64
+          [ "${{ runner.arch }}" = "ARM64" ] && ARCH=arm64
+          mkdir -p runner-pkg
+          curl -o runner-pkg/actions-runner.tar.gz -L \
+            https://github.com/actions/runner/releases/download/v${{ inputs.runner_version }}/actions-runner-osx-${ARCH}-${{ inputs.runner_version }}.tar.gz
+
+      - name: Download runner (Windows)
+        if: runner.os == 'Windows' && steps.cache.outputs.cache-hit != 'true'
+        shell: pwsh
+        run: |
+          $arch = if ("${{ runner.arch }}" -eq "ARM64") { "arm64" } else { "x64" }
+          New-Item -ItemType Directory -Force -Path runner-pkg | Out-Null
+          Invoke-WebRequest -Uri "https://github.com/actions/runner/releases/download/v${{ inputs.runner_version }}/actions-runner-win-$arch-${{ inputs.runner_version }}.zip" -OutFile runner-pkg/actions-runner.zip
+
+      - name: Save runner package
+        if: steps.cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: runner-pkg
+          key: runner-${{ runner.os }}-${{ runner.arch }}-${{ inputs.runner_version }}
+
+      - name: Extract runner (Unix)
+        if: runner.os != 'Windows'
+        run: tar xzf runner-pkg/actions-runner.tar.gz
+
+      - name: Extract runner (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: Expand-Archive -Path runner-pkg/actions-runner.zip -DestinationPath .
+
+      - name: Configure and run ephemeral (Unix)
+        if: runner.os != 'Windows'
+        run: |
+          ./config.sh --unattended --ephemeral --replace \
+            --url "${{ inputs.target_url }}" \
+            --token "${{ inputs.reg_token }}" \
+            --name "${{ inputs.runner_name }}" \
+            --labels "${{ inputs.runner_labels }}"
+          ./run.sh
+
+      - name: Configure and run ephemeral (Windows)
+        if: runner.os == 'Windows'
+        shell: cmd
+        run: |
+          call config.cmd --unattended --ephemeral --replace --url "${{ inputs.target_url }}" --token "${{ inputs.reg_token }}" --name "${{ inputs.runner_name }}" --labels "${{ inputs.runner_labels }}"
+          if errorlevel 1 exit /b 1
+          call run.cmd
