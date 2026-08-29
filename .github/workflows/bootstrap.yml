@@ -31,16 +31,18 @@ on:
         default: '2.336.0'
         type: string
       watch_url:
-        description: 查询目标 job 状态；被其他 runner 抢走或已结束后停止空等
+        description: 查询目标 job 与本 runner 实际抢到的 job
         required: false
         type: string
 
 jobs:
   bootstrap:
     runs-on: ${{ inputs.runs_on }}
+    name: ${{ inputs.runner_name }}
     permissions:
       contents: read
       actions: write
+      checks: write
     steps:
       # 按 os/arch/version 缓存压缩包，命中后跳过 GitHub Releases 下载
       - name: Restore runner package
@@ -109,9 +111,14 @@ jobs:
           RUNNER_NAME: ${{ inputs.runner_name }}
           RUNNER_LABELS: ${{ inputs.runner_labels }}
           WATCH_URL: ${{ inputs.watch_url }}
+          GITHUB_TOKEN: ${{ github.token }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          GITHUB_RUN_ID: ${{ github.run_id }}
         run: |
           import json
           import os
+          import pathlib
+          import re
           import signal
           import subprocess
           import sys
@@ -125,11 +132,53 @@ jobs:
           name = os.environ["RUNNER_NAME"]
           labels = os.environ["RUNNER_LABELS"]
           watch = (os.environ.get("WATCH_URL") or "").strip()
+          gh_token = (os.environ.get("GITHUB_TOKEN") or "").strip()
+          gh_repo = (os.environ.get("GITHUB_REPOSITORY") or "").strip()
+          gh_run = (os.environ.get("GITHUB_RUN_ID") or "").strip()
           is_win = os.name == "nt"
           keep = {"queued", "waiting", "pending", "requested"}
+          api = "https://api.github.com"
 
           def log(msg):
               print(msg, flush=True)
+
+          def title_for(job_name, job_id):
+              safe = re.sub(r"[^A-Za-z0-9._-]+", "-", str(job_name or "job")).strip("-._") or "job"
+              suffix = "-" + str(job_id)
+              return safe[: max(1, 64 - len(suffix))] + suffix
+
+          def gh(method, path, body=None):
+              data = None if body is None else json.dumps(body).encode()
+              req = urllib.request.Request(
+                  api + path,
+                  data=data,
+                  method=method,
+                  headers={
+                      "Authorization": "Bearer " + gh_token,
+                      "Accept": "application/vnd.github+json",
+                      "X-GitHub-Api-Version": "2022-11-28",
+                      "User-Agent": "bootstrap-watch",
+                      **({"Content-Type": "application/json"} if body is not None else {}),
+                  },
+              )
+              with urllib.request.urlopen(req, timeout=20) as resp:
+                  raw = resp.read()
+                  return json.loads(raw.decode()) if raw else {}
+
+          def rename_job(job_name, job_id):
+              title = title_for(job_name, job_id)
+              if title == name or not gh_token or not gh_repo or not gh_run:
+                  return
+              jobs = gh("GET", "/repos/" + gh_repo + "/actions/runs/" + gh_run + "/jobs?per_page=20")
+              for item in jobs.get("jobs") or []:
+                  if str(item.get("status") or "") != "in_progress":
+                      continue
+                  try:
+                      gh("PATCH", "/repos/" + gh_repo + "/check-runs/" + str(item.get("id")), {"name": title})
+                      log("bootstrap job 已改为实际抢到的 " + title)
+                  except urllib.error.HTTPError as exc:
+                      log("改 job name 失败 HTTP " + str(exc.code))
+                  return
 
           def job_state():
               req = urllib.request.Request(
@@ -138,18 +187,6 @@ jobs:
               )
               with urllib.request.urlopen(req, timeout=20) as resp:
                   return json.loads(resp.read().decode())
-
-          def taken_or_done_elsewhere(data):
-              status = str(data.get("status") or "")
-              actual = str(data.get("runner_name") or "")
-              if status in keep or actual == name:
-                  return False
-              if status == "in_progress":
-                  return bool(actual)
-              return status == "completed"
-
-          def ours_completed(data):
-              return str(data.get("status") or "") == "completed" and str(data.get("runner_name") or "") == name
 
           def stop(proc):
               if proc.poll() is not None:
@@ -177,25 +214,6 @@ jobs:
               log("缺少 WATCH_URL，拒绝空等")
               sys.exit(1)
 
-          try:
-              data = job_state()
-              if taken_or_done_elsewhere(data):
-                  log(
-                      "目标 job 已在其他 runner 上 "
-                      + str(data.get("status"))
-                      + " runner="
-                      + str(data.get("runner_name") or "-")
-                      + "，跳过注册"
-                  )
-                  sys.exit(0)
-          except urllib.error.HTTPError as exc:
-              if exc.code in (400, 401, 404):
-                  log("watch 预检查被拒绝 HTTP " + str(exc.code))
-                  sys.exit(1)
-              log("watch 预检查失败，继续注册: " + str(exc))
-          except (urllib.error.URLError, TimeoutError, json.JSONDecodeError, OSError) as exc:
-              log("watch 预检查失败，继续注册: " + str(exc))
-
           config = [
               "config.cmd" if is_win else "./config.sh",
               "--unattended",
@@ -216,11 +234,22 @@ jobs:
           if rc != 0:
               sys.exit(rc)
 
+          runner_cfg = pathlib.Path(root) / ".runner"
+          if runner_cfg.is_file():
+              cfg = json.loads(runner_cfg.read_text(encoding="utf-8"))
+              log("ephemeral=" + str(cfg.get("ephemeral")))
+
           popen_kw = {"cwd": root}
           if not is_win:
               popen_kw["start_new_session"] = True
-          proc = subprocess.Popen(["cmd", "/c", "run.cmd"] if is_win else ["./run.sh"], **popen_kw)
-          deadline = None
+          run_cmd = "run.cmd --once" if is_win else ["./run.sh", "--once"]
+          if is_win:
+              proc = subprocess.Popen(run_cmd, cwd=root, shell=True)
+          else:
+              proc = subprocess.Popen(run_cmd, **popen_kw)
+          renamed = False
+          idle_since = None
+          done_since = None
 
           while True:
               rc = proc.poll()
@@ -228,17 +257,30 @@ jobs:
                   sys.exit(rc)
               try:
                   data = job_state()
-                  if taken_or_done_elsewhere(data):
-                      log(
-                          "目标 job 已被其他 runner 抢走或已结束: status="
-                          + str(data.get("status"))
-                          + " runner="
-                          + str(data.get("runner_name") or "-")
-                      )
-                      stop(proc)
-                      sys.exit(0)
-                  if ours_completed(data) and deadline is None:
-                      deadline = time.time() + 120
+                  claimed = data.get("claimed") if isinstance(data.get("claimed"), dict) else None
+                  if claimed and claimed.get("id"):
+                      idle_since = None
+                      if not renamed:
+                          rename_job(claimed.get("name"), claimed.get("id"))
+                          renamed = True
+                      if str(claimed.get("status") or "") == "completed" and done_since is None:
+                          done_since = time.time() + 120
+                  else:
+                      status = str(data.get("status") or "")
+                      actual = str(data.get("runner_name") or "")
+                      if status in keep or actual == name:
+                          idle_since = None
+                      elif idle_since is None:
+                          idle_since = time.time()
+                      elif time.time() - idle_since >= 90:
+                          log(
+                              "目标 job 已结束且未抢到其他 job: status="
+                              + status
+                              + " runner="
+                              + (actual or "-")
+                          )
+                          stop(proc)
+                          sys.exit(0)
               except urllib.error.HTTPError as exc:
                   if exc.code in (400, 401, 404):
                       log("watch 被拒绝 HTTP " + str(exc.code))
@@ -247,7 +289,7 @@ jobs:
                   log("watch 失败: " + str(exc))
               except (urllib.error.URLError, TimeoutError, json.JSONDecodeError, OSError) as exc:
                   log("watch 失败: " + str(exc))
-              if deadline is not None and time.time() >= deadline:
+              if done_since is not None and time.time() >= done_since:
                   log("目标 job 已结束但 listener 未退出，结束进程")
                   stop(proc)
                   sys.exit(0)
