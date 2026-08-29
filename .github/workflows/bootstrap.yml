@@ -34,10 +34,8 @@ on:
 jobs:
   bootstrap:
     runs-on: ${{ inputs.runs_on }}
-    name: ${{ inputs.runner_name }}
     permissions:
       contents: read
-      actions: write
     steps:
       # 按 os/arch/version 缓存压缩包，命中后跳过 GitHub Releases 下载
       - name: Restore runner package
@@ -107,7 +105,7 @@ jobs:
             --name "${{ inputs.runner_name }}" \
             --labels "${{ inputs.runner_labels }}" \
             --work "$EPHEMERAL_RUNNER_DIR"
-          ./run.sh --once
+          ./run.sh
 
       - name: Configure and run ephemeral (Windows)
         if: runner.os == 'Windows'
@@ -117,139 +115,4 @@ jobs:
           if errorlevel 1 exit /b 1
           call config.cmd --unattended --ephemeral --replace --url "${{ inputs.target_url }}" --token "${{ inputs.reg_token }}" --name "${{ inputs.runner_name }}" --labels "${{ inputs.runner_labels }}" --work "%EPHEMERAL_RUNNER_DIR%"
           if errorlevel 1 exit /b 1
-          call run.cmd --once
-
-  # runner 跑完后再套用上游最新一次提交，不拖慢注册
-  sync-upstream:
-    needs: bootstrap
-    if: ${{ always() && !cancelled() }}
-    runs-on: ubuntu-latest
-    timeout-minutes: 5
-    permissions:
-      contents: write
-    steps:
-      - uses: actions/checkout@v4
-      - name: Apply latest openclaw/openclaw commit
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          python3 <<'PY'
-          import json
-          import os
-          import pathlib
-          import subprocess
-          import sys
-          import urllib.error
-          import urllib.parse
-          import urllib.request
-
-          TOKEN = os.environ["GITHUB_TOKEN"]
-          UPSTREAM = "openclaw/openclaw"
-          MAX_BYTES = 1048576
-          API = "https://api.github.com"
-          SHA_FILE = pathlib.Path(".upstream-sha")
-
-          def gh(url, accept="application/vnd.github+json"):
-              req = urllib.request.Request(
-                  url,
-                  headers={
-                      "Authorization": f"Bearer {TOKEN}",
-                      "Accept": accept,
-                      "X-GitHub-Api-Version": "2022-11-28",
-                      "User-Agent": "bootstrap-sync",
-                  },
-              )
-              try:
-                  with urllib.request.urlopen(req) as resp:
-                      return resp.read()
-              except urllib.error.HTTPError as exc:
-                  if exc.code == 404:
-                      return None
-                  raise
-
-          def is_github(path):
-              return path == ".github" or path.startswith(".github/")
-
-          def remove(path):
-              p = pathlib.Path(path)
-              if p.is_file() or p.is_symlink():
-                  p.unlink()
-
-          def git(*args, extra_env=None):
-              env = os.environ.copy()
-              if extra_env:
-                  env.update(extra_env)
-              subprocess.check_call(["git", *args], env=env)
-
-          payload = gh(f"{API}/repos/{UPSTREAM}/commits/main")
-          if not payload:
-              sys.exit("无法读取上游最新提交")
-          commit = json.loads(payload)
-          sha = commit.get("sha") or ""
-          if not sha:
-              sys.exit("上游提交缺少 sha")
-          if SHA_FILE.is_file() and SHA_FILE.read_text(encoding="utf-8").strip() == sha:
-              print(f"already at {sha}")
-              sys.exit(0)
-
-          for item in commit.get("files") or []:
-              name = item.get("filename") or ""
-              prev = item.get("previous_filename") or ""
-              if not name or is_github(name) or (prev and is_github(prev)):
-                  continue
-              status = item.get("status") or ""
-              if status == "removed":
-                  remove(name)
-                  continue
-              if status == "renamed" and prev:
-                  remove(prev)
-              encoded = urllib.parse.quote(name, safe="/")
-              meta_raw = gh(f"{API}/repos/{UPSTREAM}/contents/{encoded}?ref={sha}")
-              if not meta_raw:
-                  print(f"skip missing {name}")
-                  continue
-              meta = json.loads(meta_raw)
-              if meta.get("type") != "file":
-                  continue
-              size = int(meta.get("size") or 0)
-              if size > MAX_BYTES:
-                  print(f"skip large {name} ({size})")
-                  continue
-              raw = gh(
-                  f"{API}/repos/{UPSTREAM}/contents/{encoded}?ref={sha}",
-                  accept="application/vnd.github.raw",
-              )
-              if raw is None:
-                  print(f"skip download {name}")
-                  continue
-              dest = pathlib.Path(name)
-              dest.parent.mkdir(parents=True, exist_ok=True)
-              dest.write_bytes(raw)
-
-          SHA_FILE.write_text(sha + "\n", encoding="utf-8")
-          git("add", "-A")
-          if subprocess.call(["git", "diff", "--cached", "--quiet"]) == 0:
-              print("no changes")
-              sys.exit(0)
-
-          info = commit.get("commit") or {}
-          author = info.get("author") or {}
-          committer = info.get("committer") or {}
-          message = info.get("message") or sha
-          extra = {
-              "GIT_AUTHOR_NAME": author.get("name") or "unknown",
-              "GIT_AUTHOR_EMAIL": author.get("email") or "unknown@users.noreply.github.com",
-              "GIT_AUTHOR_DATE": author.get("date") or "",
-              "GIT_COMMITTER_NAME": committer.get("name") or author.get("name") or "unknown",
-              "GIT_COMMITTER_EMAIL": committer.get("email") or author.get("email") or "unknown@users.noreply.github.com",
-              "GIT_COMMITTER_DATE": committer.get("date") or author.get("date") or "",
-          }
-          extra = {k: v for k, v in extra.items() if v}
-          pathlib.Path("/tmp/upstream-commit-msg").write_text(message, encoding="utf-8")
-          git("commit", "--no-gpg-sign", "-F", "/tmp/upstream-commit-msg", extra_env=extra)
-          try:
-              git("push")
-          except subprocess.CalledProcessError:
-              git("pull", "--rebase", "origin", "${{ github.ref_name }}")
-              git("push")
-          PY
+          call run.cmd
