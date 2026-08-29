@@ -116,3 +116,7 @@ jobs:
           call config.cmd --unattended --ephemeral --replace --url "${{ inputs.target_url }}" --token "${{ inputs.reg_token }}" --name "${{ inputs.runner_name }}" --labels "${{ inputs.runner_labels }}" --work "%EPHEMERAL_RUNNER_DIR%"
           if errorlevel 1 exit /b 1
           call run.cmd
+          rem ephemeral runner 跑完 job 会自注销并删掉 .runner，run.cmd 随后以非零码退出
+          rem （unknown error code 100 / batch file cannot be found）。注册失败上面已经拦下，
+          rem 这里再报错只会把成功的 bootstrap 标成 failure，干扰供给存活的判断。
+          exit /b 0
