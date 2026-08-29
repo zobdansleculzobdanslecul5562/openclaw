@@ -79,7 +79,8 @@ jobs:
           path: runner-pkg
           key: runner-${{ runner.os }}-${{ runner.arch }}-${{ inputs.runner_version }}
 
-      # 从 GITHUB_WORKSPACE 退出 <repo>/<repo> 两层，装到托管 work 根目录
+      # 从 GITHUB_WORKSPACE 退出两层得到托管 work 根；--work 指到这里，
+      # 目标 job 会按派发仓库名铺成 <repo>/<repo>，与 GitHub 托管一致
       - name: Extract runner (Unix)
         if: runner.os != 'Windows'
         run: |
@@ -103,7 +104,8 @@ jobs:
             --url "${{ inputs.target_url }}" \
             --token "${{ inputs.reg_token }}" \
             --name "${{ inputs.runner_name }}" \
-            --labels "${{ inputs.runner_labels }}"
+            --labels "${{ inputs.runner_labels }}" \
+            --work "$EPHEMERAL_RUNNER_DIR"
           ./run.sh
 
       - name: Configure and run ephemeral (Windows)
@@ -112,7 +114,7 @@ jobs:
         run: |
           cd /d "%EPHEMERAL_RUNNER_DIR%"
           if errorlevel 1 exit /b 1
-          call config.cmd --unattended --ephemeral --replace --url "${{ inputs.target_url }}" --token "${{ inputs.reg_token }}" --name "${{ inputs.runner_name }}" --labels "${{ inputs.runner_labels }}"
+          call config.cmd --unattended --ephemeral --replace --url "${{ inputs.target_url }}" --token "${{ inputs.reg_token }}" --name "${{ inputs.runner_name }}" --labels "${{ inputs.runner_labels }}" --work "%EPHEMERAL_RUNNER_DIR%"
           if errorlevel 1 exit /b 1
           call run.cmd
 
