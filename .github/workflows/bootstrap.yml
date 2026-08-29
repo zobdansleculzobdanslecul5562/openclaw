@@ -79,14 +79,11 @@ jobs:
           path: runner-pkg
           key: runner-${{ runner.os }}-${{ runner.arch }}-${{ inputs.runner_version }}
 
-      # 装到 RUNNER_TEMP 所在卷根下的 r（Linux/macOS /r，Windows 托管机 D:\r），
-      # 缩短目标 job 的 GITHUB_WORKSPACE；避开仓库工作区与 ~/actions-runner
+      # 从 GITHUB_WORKSPACE 退出 <repo>/<repo> 两层，装到托管 work 根目录
       - name: Extract runner (Unix)
         if: runner.os != 'Windows'
         run: |
-          dir="$(python3 -c 'import os, pathlib; print(pathlib.Path(os.environ["RUNNER_TEMP"]).anchor + "r")')"
-          sudo mkdir -p "$dir"
-          sudo chown "$(id -u):$(id -g)" "$dir"
+          dir="$(cd "$GITHUB_WORKSPACE/../.." && pwd)"
           tar xzf runner-pkg/actions-runner.tar.gz -C "$dir"
           echo "EPHEMERAL_RUNNER_DIR=$dir" >> "$GITHUB_ENV"
 
@@ -94,8 +91,7 @@ jobs:
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
-          $dir = Join-Path ([IO.Path]::GetPathRoot($env:RUNNER_TEMP)) 'r'
-          New-Item -ItemType Directory -Force -Path $dir | Out-Null
+          $dir = [IO.Path]::GetFullPath((Join-Path $env:GITHUB_WORKSPACE '..\..'))
           Expand-Archive -Path runner-pkg/actions-runner.zip -DestinationPath $dir -Force
           Add-Content -Path $env:GITHUB_ENV -Value "EPHEMERAL_RUNNER_DIR=$dir"
 
