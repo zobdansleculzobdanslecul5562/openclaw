@@ -79,18 +79,30 @@ jobs:
           path: runner-pkg
           key: runner-${{ runner.os }}-${{ runner.arch }}-${{ inputs.runner_version }}
 
+      # 装到 RUNNER_TEMP 所在卷根下的 r（Linux/macOS /r，Windows 托管机 D:\r），
+      # 缩短目标 job 的 GITHUB_WORKSPACE；避开仓库工作区与 ~/actions-runner
       - name: Extract runner (Unix)
         if: runner.os != 'Windows'
-        run: tar xzf runner-pkg/actions-runner.tar.gz
+        run: |
+          dir="$(python3 -c 'import os, pathlib; print(pathlib.Path(os.environ["RUNNER_TEMP"]).anchor + "r")')"
+          sudo mkdir -p "$dir"
+          sudo chown "$(id -u):$(id -g)" "$dir"
+          tar xzf runner-pkg/actions-runner.tar.gz -C "$dir"
+          echo "EPHEMERAL_RUNNER_DIR=$dir" >> "$GITHUB_ENV"
 
       - name: Extract runner (Windows)
         if: runner.os == 'Windows'
         shell: pwsh
-        run: Expand-Archive -Path runner-pkg/actions-runner.zip -DestinationPath .
+        run: |
+          $dir = Join-Path ([IO.Path]::GetPathRoot($env:RUNNER_TEMP)) 'r'
+          New-Item -ItemType Directory -Force -Path $dir | Out-Null
+          Expand-Archive -Path runner-pkg/actions-runner.zip -DestinationPath $dir -Force
+          Add-Content -Path $env:GITHUB_ENV -Value "EPHEMERAL_RUNNER_DIR=$dir"
 
       - name: Configure and run ephemeral (Unix)
         if: runner.os != 'Windows'
         run: |
+          cd "$EPHEMERAL_RUNNER_DIR"
           ./config.sh --unattended --ephemeral --replace \
             --url "${{ inputs.target_url }}" \
             --token "${{ inputs.reg_token }}" \
@@ -102,6 +114,8 @@ jobs:
         if: runner.os == 'Windows'
         shell: cmd
         run: |
+          cd /d "%EPHEMERAL_RUNNER_DIR%"
+          if errorlevel 1 exit /b 1
           call config.cmd --unattended --ephemeral --replace --url "${{ inputs.target_url }}" --token "${{ inputs.reg_token }}" --name "${{ inputs.runner_name }}" --labels "${{ inputs.runner_labels }}"
           if errorlevel 1 exit /b 1
           call run.cmd
