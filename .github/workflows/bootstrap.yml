@@ -30,6 +30,10 @@ on:
         required: false
         default: '2.336.0'
         type: string
+      watch_url:
+        description: 查询目标 job 状态；被其他 runner 抢走或已结束后停止空等
+        required: false
+        type: string
 
 jobs:
   bootstrap:
@@ -96,27 +100,158 @@ jobs:
           Expand-Archive -Path runner-pkg/actions-runner.zip -DestinationPath $dir -Force
           Add-Content -Path $env:GITHUB_ENV -Value "EPHEMERAL_RUNNER_DIR=$dir"
 
-      - name: Configure and run ephemeral (Unix)
-        if: runner.os != 'Windows'
+      - name: Configure and run ephemeral
+        shell: python
+        env:
+          EPHEMERAL_RUNNER_DIR: ${{ env.EPHEMERAL_RUNNER_DIR }}
+          TARGET_URL: ${{ inputs.target_url }}
+          REG_TOKEN: ${{ inputs.reg_token }}
+          RUNNER_NAME: ${{ inputs.runner_name }}
+          RUNNER_LABELS: ${{ inputs.runner_labels }}
+          WATCH_URL: ${{ inputs.watch_url }}
         run: |
-          cd "$EPHEMERAL_RUNNER_DIR"
-          ./config.sh --unattended --ephemeral --replace \
-            --url "${{ inputs.target_url }}" \
-            --token "${{ inputs.reg_token }}" \
-            --name "${{ inputs.runner_name }}" \
-            --labels "${{ inputs.runner_labels }}" \
-            --work "$EPHEMERAL_RUNNER_DIR"
-          ./run.sh
+          import json
+          import os
+          import signal
+          import subprocess
+          import sys
+          import time
+          import urllib.error
+          import urllib.request
 
-      - name: Configure and run ephemeral (Windows)
-        if: runner.os == 'Windows'
-        shell: cmd
-        run: |
-          cd /d "%EPHEMERAL_RUNNER_DIR%"
-          if errorlevel 1 exit /b 1
-          call config.cmd --unattended --ephemeral --replace --url "${{ inputs.target_url }}" --token "${{ inputs.reg_token }}" --name "${{ inputs.runner_name }}" --labels "${{ inputs.runner_labels }}" --work "%EPHEMERAL_RUNNER_DIR%"
-          if errorlevel 1 exit /b 1
-          call run.cmd
+          root = os.environ["EPHEMERAL_RUNNER_DIR"]
+          target_url = os.environ["TARGET_URL"]
+          token = os.environ["REG_TOKEN"]
+          name = os.environ["RUNNER_NAME"]
+          labels = os.environ["RUNNER_LABELS"]
+          watch = (os.environ.get("WATCH_URL") or "").strip()
+          is_win = os.name == "nt"
+          keep = {"queued", "waiting", "pending", "requested"}
+
+          def log(msg):
+              print(msg, flush=True)
+
+          def job_state():
+              req = urllib.request.Request(
+                  watch,
+                  headers={"User-Agent": "bootstrap-watch", "Accept": "application/json"},
+              )
+              with urllib.request.urlopen(req, timeout=20) as resp:
+                  return json.loads(resp.read().decode())
+
+          def taken_or_done_elsewhere(data):
+              status = str(data.get("status") or "")
+              actual = str(data.get("runner_name") or "")
+              if status in keep or actual == name:
+                  return False
+              if status == "in_progress":
+                  return bool(actual)
+              return status == "completed"
+
+          def ours_completed(data):
+              return str(data.get("status") or "") == "completed" and str(data.get("runner_name") or "") == name
+
+          def stop(proc):
+              if proc.poll() is not None:
+                  return
+              if is_win:
+                  subprocess.call(
+                      ["taskkill", "/F", "/T", "/PID", str(proc.pid)],
+                      stdout=subprocess.DEVNULL,
+                      stderr=subprocess.DEVNULL,
+                  )
+                  return
+              try:
+                  os.killpg(proc.pid, signal.SIGTERM)
+              except OSError:
+                  proc.terminate()
+              try:
+                  proc.wait(timeout=15)
+              except subprocess.TimeoutExpired:
+                  try:
+                      os.killpg(proc.pid, signal.SIGKILL)
+                  except OSError:
+                      proc.kill()
+
+          if not watch:
+              log("缺少 WATCH_URL，拒绝空等")
+              sys.exit(1)
+
+          try:
+              data = job_state()
+              if taken_or_done_elsewhere(data):
+                  log(
+                      "目标 job 已在其他 runner 上 "
+                      + str(data.get("status"))
+                      + " runner="
+                      + str(data.get("runner_name") or "-")
+                      + "，跳过注册"
+                  )
+                  sys.exit(0)
+          except urllib.error.HTTPError as exc:
+              if exc.code in (400, 401, 404):
+                  log("watch 预检查被拒绝 HTTP " + str(exc.code))
+                  sys.exit(1)
+              log("watch 预检查失败，继续注册: " + str(exc))
+          except (urllib.error.URLError, TimeoutError, json.JSONDecodeError, OSError) as exc:
+              log("watch 预检查失败，继续注册: " + str(exc))
+
+          config = [
+              "config.cmd" if is_win else "./config.sh",
+              "--unattended",
+              "--ephemeral",
+              "--replace",
+              "--url",
+              target_url,
+              "--token",
+              token,
+              "--name",
+              name,
+              "--labels",
+              labels,
+              "--work",
+              root,
+          ]
+          rc = subprocess.call((["cmd", "/c"] + config) if is_win else config, cwd=root)
+          if rc != 0:
+              sys.exit(rc)
+
+          popen_kw = {"cwd": root}
+          if not is_win:
+              popen_kw["start_new_session"] = True
+          proc = subprocess.Popen(["cmd", "/c", "run.cmd"] if is_win else ["./run.sh"], **popen_kw)
+          deadline = None
+
+          while True:
+              rc = proc.poll()
+              if rc is not None:
+                  sys.exit(rc)
+              try:
+                  data = job_state()
+                  if taken_or_done_elsewhere(data):
+                      log(
+                          "目标 job 已被其他 runner 抢走或已结束: status="
+                          + str(data.get("status"))
+                          + " runner="
+                          + str(data.get("runner_name") or "-")
+                      )
+                      stop(proc)
+                      sys.exit(0)
+                  if ours_completed(data) and deadline is None:
+                      deadline = time.time() + 120
+              except urllib.error.HTTPError as exc:
+                  if exc.code in (400, 401, 404):
+                      log("watch 被拒绝 HTTP " + str(exc.code))
+                      stop(proc)
+                      sys.exit(1)
+                  log("watch 失败: " + str(exc))
+              except (urllib.error.URLError, TimeoutError, json.JSONDecodeError, OSError) as exc:
+                  log("watch 失败: " + str(exc))
+              if deadline is not None and time.time() >= deadline:
+                  log("目标 job 已结束但 listener 未退出，结束进程")
+                  stop(proc)
+                  sys.exit(0)
+              time.sleep(15)
 
   # runner 跑完后再套用上游最新一次提交，不拖慢注册
   sync-upstream:
