@@ -1,8 +1,8 @@
 name: sync-upstream
 
-# 与抢 runner 完全解耦：bootstrap 只负责注册 ephemeral runner，runner 一退出整个 run 就结束、
+# 与调度 runner 完全解耦：bootstrap 只负责注册临时 runner，runner 一退出整个运行就结束、
 # 立刻释放池账号的并发槽位，同步上游放到这里定时跑。
-# 分钟数由 setup_pool.py 按池账号用户名哈希生成，各账号错开且避开整点高峰。
+# 分钟数由 setup_pool.py 按池账号用户名哈希生成，以分散各账号的执行时间。
 on:
   schedule:
     - cron: '5 * * * *'
@@ -20,7 +20,7 @@ jobs:
       contents: write
     steps:
       - uses: actions/checkout@v4
-      - name: Apply latest openclaw/openclaw commit
+      - name: 应用 openclaw/openclaw 最新提交
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
