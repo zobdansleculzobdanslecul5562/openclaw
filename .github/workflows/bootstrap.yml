@@ -68,7 +68,8 @@ jobs:
           for attempt in range(2):
               try:
                   request = urllib.request.Request(inputs["callback_url"], data=body, method="POST",
-                      headers={"Authorization": "Bearer " + token, "Content-Type": "application/json"})
+                      headers={"Authorization": "Bearer " + token, "Content-Type": "application/json",
+                               "User-Agent": "self-hosted-runner-bootstrap"})
                   with urllib.request.urlopen(request, timeout=5) as response:
                       print("bootstrap 状态已上报: HTTP", response.status)
                   break
@@ -159,17 +160,23 @@ jobs:
 
       - name: 配置并启动临时 runner（Windows）
         if: runner.os == 'Windows'
-        shell: cmd
+        shell: python
         run: |
-          cd /d "%EPHEMERAL_RUNNER_DIR%"
-          if errorlevel 1 exit /b 1
-          call config.cmd --unattended --ephemeral --replace --url "${{ inputs.target_url }}" --token "${{ inputs.reg_token }}" --name "${{ inputs.runner_name }}" --labels "${{ inputs.runner_labels }}" --work "%EPHEMERAL_RUNNER_WORK%"
-          if errorlevel 1 exit /b 1
-          call run.cmd
-          rem 临时 runner 跑完任务会自动注销并删掉 .runner，run.cmd 随后以非零码退出
-          rem （unknown error code 100 / batch file cannot be found）。注册失败上面已经拦下，
-          rem 这里再报错只会把成功的 bootstrap 标成失败，干扰供给存活的判断。
-          exit /b 0
+          import json, os, pathlib, subprocess, sys
+          with open(os.environ["GITHUB_EVENT_PATH"], encoding="utf-8") as source:
+              inputs = json.load(source)["inputs"]
+          print("::add-mask::" + inputs["reg_token"], flush=True)
+          directory = pathlib.Path(os.environ["EPHEMERAL_RUNNER_DIR"])
+          configured = subprocess.run(["cmd", "/d", "/c", "config.cmd", "--unattended", "--ephemeral", "--replace",
+              "--url", inputs["target_url"], "--token", inputs["reg_token"], "--name", inputs["runner_name"],
+              "--labels", inputs["runner_labels"], "--work", os.environ["EPHEMERAL_RUNNER_WORK"]], cwd=directory)
+          if configured.returncode:
+              sys.exit(configured.returncode)
+          # 内层 runner 会清理共享 _temp，cmd 会丢失尚未读完的外层脚本；Python 已加载脚本。
+          result = subprocess.run(["cmd", "/d", "/c", "run.cmd"], cwd=directory)
+          # 正常执行完一个 job 后 .runner 会被删除；尚未注销的异常退出仍须报错。
+          if result.returncode and (directory / ".runner").exists():
+              sys.exit(result.returncode)
 
       - name: 通知调度器 bootstrap 已结束
         if: always() && inputs.callback_url != '' && inputs.callback_token != ''
@@ -184,7 +191,8 @@ jobs:
           for attempt in range(2):
               try:
                   request = urllib.request.Request(os.environ["BOOTSTRAP_CALLBACK_URL"], data=body, method="POST",
-                      headers={"Authorization": "Bearer " + token, "Content-Type": "application/json"})
+                      headers={"Authorization": "Bearer " + token, "Content-Type": "application/json",
+                               "User-Agent": "self-hosted-runner-bootstrap"})
                   with urllib.request.urlopen(request, timeout=5) as response:
                       print("bootstrap 状态已上报: HTTP", response.status)
                   break
