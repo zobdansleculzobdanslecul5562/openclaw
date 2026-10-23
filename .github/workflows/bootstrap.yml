@@ -15,7 +15,13 @@ on:
         type: string
       reg_token:
         description: runner 注册令牌
-        required: true
+        required: false
+        default: ''
+        type: string
+      jit_config:
+        description: 调度器预先生成的 JIT runner 配置
+        required: false
+        default: ''
         type: string
       runner_name:
         description: runner 名称
@@ -26,10 +32,15 @@ on:
         required: true
         type: string
       runner_version:
-        description: actions/runner 版本
+        description: 无法复用托管 runner 时下载的 actions/runner 版本
         required: false
         default: '2.336.0'
         type: string
+      reuse_host_runner:
+        description: 优先复用托管机器上的 runner 程序
+        required: false
+        default: true
+        type: boolean
       callback_url:
         description: 调度服务的状态回调地址
         required: false
@@ -81,16 +92,91 @@ jobs:
       # 二进制目录与 --work 分开，缓存中只包含未注册的 runner。
       # 不能放进 RUNNER_TEMP：内层 runner 接活时会清空共享的 _temp。
       - name: 设置 runner 目录
+        id: prepare
         shell: python
+        env:
+          REUSE_HOST_RUNNER: ${{ inputs.reuse_host_runner }}
         run: |
-          import os, pathlib
+          import os, pathlib, shutil, subprocess, tempfile, time
+
+          def find_host_runner(system):
+              pid = os.getppid()
+              if system == "Windows":
+                  command = (
+                      "$currentId = " + str(pid) + "; "
+                      "for ($i = 0; $i -lt 8 -and $currentId; $i++) { "
+                      "$p = Get-CimInstance Win32_Process -Filter \"ProcessId=$currentId\"; "
+                      "if (-not $p) { break }; "
+                      "if ($p.Name -eq 'Runner.Worker.exe') { $p.ExecutablePath; break }; "
+                      "$currentId = $p.ParentProcessId }")
+                  executable = subprocess.check_output(
+                      ["pwsh", "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", command],
+                      text=True, timeout=10).strip()
+                  return pathlib.Path(executable).parent.parent if executable else None
+              for _ in range(8):
+                  if system == "Linux":
+                      executable = os.readlink(f"/proc/{pid}/exe")
+                      parent = next(line.split()[1] for line in
+                          pathlib.Path(f"/proc/{pid}/status").read_text().splitlines() if line.startswith("PPid:"))
+                  else:
+                      parent, executable = subprocess.check_output(
+                          ["ps", "-p", str(pid), "-o", "ppid=", "-o", "comm="],
+                          text=True, timeout=5).strip().split(None, 1)
+                  if pathlib.Path(executable).name == "Runner.Worker":
+                      return pathlib.Path(executable).parent.parent
+                  pid = int(parent)
+                  if not pid:
+                      break
+              return None
+
+          def clone_host_runner(source):
+              extension = ".cmd" if os.name == "nt" else ".sh"
+              for name in ("bin", "externals", "config" + extension, "run" + extension):
+                  if not (source / name).exists():
+                      raise RuntimeError("Incomplete hosted runner installation")
+              # 放到同一磁盘，优先硬链接程序文件；配置与凭据始终保存在新的目录。
+              directory = pathlib.Path(tempfile.mkdtemp(prefix="ephemeral-runner-", dir=source.parent))
+              counts = {"linked": 0, "copied": 0}
+              def copy_program(original, target):
+                  try:
+                      os.link(original, target)
+                      counts["linked"] += 1
+                  except OSError:
+                      shutil.copy2(original, target)
+                      counts["copied"] += 1
+                  return target
+              for name in ("bin", "externals"):
+                  shutil.copytree(source / name, directory / name, symlinks=True, copy_function=copy_program)
+              # 不复制 .runner、.credentials、.env、.path、日志及已生成的 run-helper。
+              for name in ("config.sh", "env.sh", "run.sh", "run-helper.sh.template", "safe_sleep.sh",
+                           "config.cmd", "run.cmd", "run-helper.cmd.template"):
+                  if (source / name).is_file():
+                      copy_program(source / name, directory / name)
+              return directory, counts
+
+          started = time.monotonic()
           work = pathlib.Path(os.environ["GITHUB_WORKSPACE"]).resolve().parent.parent
+          directory = work / ".ephemeral-runner"
+          ready = False
+          if (os.environ.get("REUSE_HOST_RUNNER", "true").lower() == "true"
+                  and os.environ.get("RUNNER_ENVIRONMENT") == "github-hosted"):
+              try:
+                  source = find_host_runner(os.environ["RUNNER_OS"])
+                  if source is not None:
+                      directory, counts = clone_host_runner(source)
+                      ready = True
+                      print(f"Runner programs reused: version={source.name} {counts} seconds={time.monotonic() - started:.3f}")
+              except (OSError, RuntimeError, ValueError, subprocess.SubprocessError) as error:
+                  print(f"Runner reuse unavailable ({type(error).__name__}); using package fallback")
           with open(os.environ["GITHUB_ENV"], "a", encoding="utf-8") as target:
-              target.write(f"EPHEMERAL_RUNNER_DIR={work / '.ephemeral-runner'}\n")
+              target.write(f"EPHEMERAL_RUNNER_DIR={directory}\n")
               target.write(f"EPHEMERAL_RUNNER_WORK={work}\n")
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as target:
+              target.write(f"ready={str(ready).lower()}\n")
 
       # 按系统、架构和版本缓存解压后的文件，命中后直接注册，避免重复解压。
       - name: 恢复 runner 文件缓存
+        if: steps.prepare.outputs.ready != 'true'
         id: cache
         uses: actions/cache/restore@v4
         with:
@@ -98,7 +184,7 @@ jobs:
           key: runner-files-v1-${{ runner.os }}-${{ runner.arch }}-${{ inputs.runner_version }}
 
       - name: 下载 runner（Linux）
-        if: runner.os == 'Linux' && steps.cache.outputs.cache-hit != 'true'
+        if: steps.prepare.outputs.ready != 'true' && runner.os == 'Linux' && steps.cache.outputs.cache-hit != 'true'
         run: |
           ARCH=x64
           [ "${{ runner.arch }}" = "ARM64" ] && ARCH=arm64
@@ -107,7 +193,7 @@ jobs:
             https://github.com/actions/runner/releases/download/v${{ inputs.runner_version }}/actions-runner-linux-${ARCH}-${{ inputs.runner_version }}.tar.gz
 
       - name: 下载 runner（macOS）
-        if: runner.os == 'macOS' && steps.cache.outputs.cache-hit != 'true'
+        if: steps.prepare.outputs.ready != 'true' && runner.os == 'macOS' && steps.cache.outputs.cache-hit != 'true'
         run: |
           ARCH=x64
           [ "${{ runner.arch }}" = "ARM64" ] && ARCH=arm64
@@ -116,7 +202,7 @@ jobs:
             https://github.com/actions/runner/releases/download/v${{ inputs.runner_version }}/actions-runner-osx-${ARCH}-${{ inputs.runner_version }}.tar.gz
 
       - name: 下载 runner（Windows）
-        if: runner.os == 'Windows' && steps.cache.outputs.cache-hit != 'true'
+        if: steps.prepare.outputs.ready != 'true' && runner.os == 'Windows' && steps.cache.outputs.cache-hit != 'true'
         shell: pwsh
         run: |
           $arch = if ("${{ runner.arch }}" -eq "ARM64") { "arm64" } else { "x64" }
@@ -124,13 +210,13 @@ jobs:
           Invoke-WebRequest -Uri "https://github.com/actions/runner/releases/download/v${{ inputs.runner_version }}/actions-runner-win-$arch-${{ inputs.runner_version }}.zip" -OutFile runner-pkg/actions-runner.zip
 
       - name: 解压 runner（Unix）
-        if: runner.os != 'Windows' && steps.cache.outputs.cache-hit != 'true'
+        if: steps.prepare.outputs.ready != 'true' && runner.os != 'Windows' && steps.cache.outputs.cache-hit != 'true'
         run: |
           mkdir -p "$EPHEMERAL_RUNNER_DIR"
           tar xzf runner-pkg/actions-runner.tar.gz -C "$EPHEMERAL_RUNNER_DIR"
 
       - name: 解压 runner（Windows）
-        if: runner.os == 'Windows' && steps.cache.outputs.cache-hit != 'true'
+        if: steps.prepare.outputs.ready != 'true' && runner.os == 'Windows' && steps.cache.outputs.cache-hit != 'true'
         shell: pwsh
         run: |
           New-Item -ItemType Directory -Force -Path $env:EPHEMERAL_RUNNER_DIR | Out-Null
@@ -139,15 +225,45 @@ jobs:
 
       # 必须在注册前保存；注册后目录里会生成 .runner 和 .credentials 等凭据。
       - name: 保存 runner 文件缓存
-        if: steps.cache.outputs.cache-hit != 'true'
+        if: steps.prepare.outputs.ready != 'true' && steps.cache.outputs.cache-hit != 'true'
         continue-on-error: true
         uses: actions/cache/save@v4
         with:
           path: ${{ env.EPHEMERAL_RUNNER_DIR }}
           key: ${{ steps.cache.outputs.cache-primary-key }}
 
+      - name: 启动 JIT runner
+        if: inputs.jit_config != ''
+        shell: python
+        run: |
+          import base64, json, os, pathlib, subprocess, sys
+          with open(os.environ["GITHUB_EVENT_PATH"], encoding="utf-8") as source:
+              inputs = json.load(source)["inputs"]
+          encoded = inputs["jit_config"]
+          print("::add-mask::" + encoded, flush=True)
+          bundle = json.loads(base64.b64decode(encoded))
+          if any("/" in name or "\\" in name or name in (".", "..") for name in bundle):
+              raise ValueError("Invalid JIT configuration path")
+          settings = json.loads(base64.b64decode(bundle[".runner"]))
+          work_key = next(name for name in settings if name.lower() == "workfolder")
+          settings[work_key] = os.environ["EPHEMERAL_RUNNER_WORK"]
+          bundle[".runner"] = base64.b64encode(json.dumps(settings).encode()).decode()
+          encoded = base64.b64encode(json.dumps(bundle).encode()).decode()
+          print("::add-mask::" + encoded, flush=True)
+          directory = pathlib.Path(os.environ["EPHEMERAL_RUNNER_DIR"])
+          executable = directory / "bin" / ("Runner.Listener.exe" if os.name == "nt" else "Runner.Listener")
+          # 保留配置标记，启动失败时不会因为尚未生成 .runner 而误判为已经注销。
+          registration = directory / ".runner"
+          registration.write_bytes(base64.b64decode(bundle[".runner"]))
+          # Runner 读取后会移除该环境变量，配置不进入命令行、缓存或后续 job 的环境。
+          child_env = {**os.environ, "ACTIONS_RUNNER_INPUT_JITCONFIG": encoded}
+          result = subprocess.run([str(executable), "run"], cwd=directory, env=child_env)
+          # 部分托管版本完成一次性任务后返回 100；只有本地注册已删除时才接受它。
+          if result.returncode and not (result.returncode == 100 and not registration.exists()):
+              sys.exit(result.returncode)
+
       - name: 配置并启动临时 runner（Unix）
-        if: runner.os != 'Windows'
+        if: runner.os != 'Windows' && inputs.jit_config == ''
         run: |
           cd "$EPHEMERAL_RUNNER_DIR"
           ./config.sh --unattended --ephemeral --replace \
@@ -159,7 +275,7 @@ jobs:
           ./run.sh
 
       - name: 配置并启动临时 runner（Windows）
-        if: runner.os == 'Windows'
+        if: runner.os == 'Windows' && inputs.jit_config == ''
         shell: python
         run: |
           import json, os, pathlib, subprocess, sys
