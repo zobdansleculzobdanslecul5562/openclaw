@@ -48,57 +48,38 @@ jobs:
     permissions:
       contents: read
     steps:
-      - name: 准备 bootstrap 回调
-        if: inputs.callback_url != '' && inputs.callback_token != ''
-        continue-on-error: true
+      - name: 启动临时 runner
         shell: python
         run: |
-          import json, os, pathlib
-          with open(os.environ["GITHUB_EVENT_PATH"], encoding="utf-8") as source:
-              inputs = json.load(source)["inputs"]
-          token = inputs["callback_token"]
-          print("::add-mask::" + token, flush=True)
-          # 先屏蔽凭据，再传给后续步骤；内层 runner 会覆盖事件文件，结束通知不能再读它。
-          with open(os.environ["GITHUB_ENV"], "a", encoding="utf-8") as target:
-              for name, value in {"BOOTSTRAP_CALLBACK_URL": inputs["callback_url"],
-                                  "BOOTSTRAP_CALLBACK_TOKEN": token,
-                                  "BOOTSTRAP_CALLBACK_RUNNER_NAME": inputs["runner_name"]}.items():
-                  target.write(name + "=" + value + "\n")
-          # 网络通知在启动 listener 时并行发送，不让 HTTP 重试阻塞目标任务接活。
-          # 放在共享 _temp 和 checkout 目录之外，避免内层 runner 清理这些目录。
-          callback_script = pathlib.Path(os.environ["GITHUB_WORKSPACE"]).resolve().parent.parent / (
-              ".bootstrap-callback-" + os.environ["GITHUB_RUN_ID"] + ".py")
-          callback_script.write_text("""import json, os, time, urllib.error, urllib.request
-          token = os.environ["BOOTSTRAP_CALLBACK_TOKEN"]
-          body = json.dumps({"action": "started", "runnerName": os.environ["BOOTSTRAP_CALLBACK_RUNNER_NAME"],
-                             "runId": int(os.environ["GITHUB_RUN_ID"])}).encode()
-          for attempt in range(2):
-              try:
-                  request = urllib.request.Request(os.environ["BOOTSTRAP_CALLBACK_URL"], data=body, method="POST",
-                      headers={"Authorization": "Bearer " + token, "Content-Type": "application/json",
-                               "User-Agent": "self-hosted-runner-bootstrap"})
-                  with urllib.request.urlopen(request, timeout=5) as response:
-                      print("bootstrap callback status: HTTP", response.status)
-                  break
-              except (urllib.error.URLError, TimeoutError, OSError):
-                  if attempt == 1:
-                      print("bootstrap started callback unavailable after two attempts", flush=True)
-                      break
-                  time.sleep(1)
-          """, encoding="utf-8")
-          with open(os.environ["GITHUB_ENV"], "a", encoding="utf-8") as target:
-              target.write("BOOTSTRAP_CALLBACK_SCRIPT=" + str(callback_script) + "\n")
+          import base64, json, os, pathlib, runpy, shutil, subprocess, sys, tempfile, textwrap, threading, time
 
-      # 仅复用托管机器上的程序文件，配置与凭据保存在独立目录。
-      # 不能放进 RUNNER_TEMP：内层 runner 接活时会清空共享的 _temp。
-      - name: 设置 runner 目录
-        shell: python
-        run: |
-          import os, pathlib, shutil, subprocess, tempfile, time
+          print("Bootstrap process started", flush=True)
 
           def find_host_runner(system):
               pid = os.getppid()
               if system == "Windows":
+                  # Python shell 通常由 Runner.Worker 直接启动，原生查询省去 PowerShell 和 WMI 启动。
+                  if os.name == "nt":
+                      import ctypes
+                      from ctypes import wintypes
+                      kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+                      kernel.OpenProcess.argtypes = (wintypes.DWORD, wintypes.BOOL, wintypes.DWORD)
+                      kernel.OpenProcess.restype = wintypes.HANDLE
+                      kernel.QueryFullProcessImageNameW.argtypes = (wintypes.HANDLE, wintypes.DWORD,
+                          wintypes.LPWSTR, ctypes.POINTER(wintypes.DWORD))
+                      kernel.QueryFullProcessImageNameW.restype = wintypes.BOOL
+                      kernel.CloseHandle.argtypes = (wintypes.HANDLE,)
+                      handle = kernel.OpenProcess(0x1000, False, pid)
+                      if handle:
+                          try:
+                              executable, size = ctypes.create_unicode_buffer(32768), wintypes.DWORD(32768)
+                              if kernel.QueryFullProcessImageNameW(handle, 0, executable, ctypes.byref(size)):
+                                  candidate = pathlib.Path(executable.value)
+                                  if candidate.name.lower() == "runner.worker.exe":
+                                      print("Runner discovery: direct parent process", flush=True)
+                                      return candidate.parent.parent
+                          finally:
+                              kernel.CloseHandle(handle)
                   command = (
                       "$currentId = " + str(pid) + "; "
                       "for ($i = 0; $i -lt 8 -and $currentId; $i++) { "
@@ -142,8 +123,12 @@ jobs:
                       shutil.copy2(original, target)
                       counts["copied"] += 1
                   return target
-              for name in ("bin", "externals"):
-                  shutil.copytree(source / name, directory / name, symlinks=True, copy_function=copy_program)
+              shutil.copytree(source / "bin", directory / "bin", symlinks=True, copy_function=copy_program)
+              if os.name == "nt":
+                  shutil.copytree(source / "externals", directory / "externals", symlinks=True, copy_function=copy_program)
+              else:
+                  # Node 的头文件数以千计；目录链接省去逐个遍历，bin 仍独立以保持配置根目录隔离。
+                  os.symlink(source / "externals", directory / "externals", target_is_directory=True)
               # 不复制 .runner、.credentials、.env、.path、日志及已生成的 run-helper。
               for name in ("config.sh", "env.sh", "run.sh", "run-helper.sh.template", "safe_sleep.sh",
                            "config.cmd", "run.cmd", "run-helper.cmd.template"):
@@ -151,94 +136,123 @@ jobs:
                       copy_program(source / name, directory / name)
               return directory, counts
 
-          started = time.monotonic()
-          work = pathlib.Path(os.environ["GITHUB_WORKSPACE"]).resolve().parent.parent
-          if os.environ.get("RUNNER_ENVIRONMENT") != "github-hosted":
-              raise RuntimeError("Bootstrap requires a GitHub-hosted runner")
-          source = find_host_runner(os.environ["RUNNER_OS"])
-          if source is None:
-              raise RuntimeError("Could not locate the hosted Runner.Worker installation")
-          directory, counts = clone_host_runner(source)
-          print(f"Runner programs reused: version={source.name} {counts} seconds={time.monotonic() - started:.3f}")
-          with open(os.environ["GITHUB_ENV"], "a", encoding="utf-8") as target:
-              target.write(f"EPHEMERAL_RUNNER_DIR={directory}\n")
-              target.write(f"EPHEMERAL_RUNNER_WORK={work}\n")
+          def prepare_callback():
+              with open(os.environ["GITHUB_EVENT_PATH"], encoding="utf-8") as source:
+                  inputs = json.load(source)["inputs"]
+              if not inputs.get("callback_url") or not inputs.get("callback_token"):
+                  return
+              token = inputs["callback_token"]
+              print("::add-mask::" + token, flush=True)
+              # 只保存在本进程；内层 runner 会清空共享 _temp 并覆盖事件文件。
+              # 网络通知与目录准备、listener 启动并行发送，不让 HTTP 重试阻塞接活。
+              # 放在共享 _temp 和 checkout 目录之外，避免内层 runner 清理这些目录。
+              callback_script = pathlib.Path(os.environ["GITHUB_WORKSPACE"]).resolve().parent.parent / (
+                  ".bootstrap-callback-" + os.environ["GITHUB_RUN_ID"] + ".py")
+              callback_script.write_text(textwrap.dedent("""
+              import json, os, time, urllib.error, urllib.request
+              token = os.environ["BOOTSTRAP_CALLBACK_TOKEN"]
+              body = json.dumps({"action": "started", "runnerName": os.environ["BOOTSTRAP_CALLBACK_RUNNER_NAME"],
+                                 "runId": int(os.environ["GITHUB_RUN_ID"])}).encode()
+              for attempt in range(2):
+                  try:
+                      request = urllib.request.Request(os.environ["BOOTSTRAP_CALLBACK_URL"], data=body, method="POST",
+                          headers={"Authorization": "Bearer " + token, "Content-Type": "application/json",
+                                   "User-Agent": "self-hosted-runner-bootstrap"})
+                      with urllib.request.urlopen(request, timeout=5) as response:
+                          print("bootstrap callback status: HTTP", response.status, flush=True)
+                      break
+                  except (urllib.error.URLError, TimeoutError, OSError):
+                      if attempt == 1:
+                          print("bootstrap started callback unavailable after two attempts", flush=True)
+                          break
+                      time.sleep(1)
+              """), encoding="utf-8")
+              os.environ.update(BOOTSTRAP_CALLBACK_URL=inputs["callback_url"], BOOTSTRAP_CALLBACK_TOKEN=token,
+                                BOOTSTRAP_CALLBACK_RUNNER_NAME=inputs["runner_name"], BOOTSTRAP_CALLBACK_SCRIPT=str(callback_script))
 
-      - name: 启动 JIT runner
-        if: inputs.jit_config != ''
-        shell: python
-        run: |
-          import base64, json, os, pathlib, runpy, subprocess, sys, threading
-          with open(os.environ["GITHUB_EVENT_PATH"], encoding="utf-8") as source:
-              inputs = json.load(source)["inputs"]
-          encoded = inputs["jit_config"]
-          print("::add-mask::" + encoded, flush=True)
-          bundle = json.loads(base64.b64decode(encoded))
-          if any("/" in name or "\\" in name or name in (".", "..") for name in bundle):
-              raise ValueError("Invalid JIT configuration path")
-          settings = json.loads(base64.b64decode(bundle[".runner"]))
-          work_key = next(name for name in settings if name.lower() == "workfolder")
-          settings[work_key] = os.environ["EPHEMERAL_RUNNER_WORK"]
-          bundle[".runner"] = base64.b64encode(json.dumps(settings).encode()).decode()
-          encoded = base64.b64encode(json.dumps(bundle).encode()).decode()
-          print("::add-mask::" + encoded, flush=True)
-          directory = pathlib.Path(os.environ["EPHEMERAL_RUNNER_DIR"])
-          executable = directory / "bin" / ("Runner.Listener.exe" if os.name == "nt" else "Runner.Listener")
-          # 保留配置标记，启动失败时不会因为尚未生成 .runner 而误判为已经注销。
-          registration = directory / ".runner"
-          registration.write_bytes(base64.b64decode(bundle[".runner"]))
-          # Runner 读取后会移除该环境变量，配置不进入命令行、缓存或后续 job 的环境。
-          child_env = {**os.environ, "ACTIONS_RUNNER_INPUT_JITCONFIG": encoded}
-          if callback_script := os.environ.get("BOOTSTRAP_CALLBACK_SCRIPT"):
-              threading.Thread(target=runpy.run_path, args=(callback_script,)).start()
-          result = subprocess.run([str(executable), "run"], cwd=directory, env=child_env)
-          # 部分托管版本完成一次性任务后返回 100；只有本地注册已删除时才接受它。
-          if result.returncode and not (result.returncode == 100 and not registration.exists()):
-              sys.exit(result.returncode)
+          def prepare_runner():
+              started = time.monotonic()
+              work = pathlib.Path(os.environ["GITHUB_WORKSPACE"]).resolve().parent.parent
+              if os.environ.get("RUNNER_ENVIRONMENT") != "github-hosted":
+                  raise RuntimeError("Bootstrap requires a GitHub-hosted runner")
+              source = find_host_runner(os.environ["RUNNER_OS"])
+              if source is None:
+                  raise RuntimeError("Could not locate the hosted Runner.Worker installation")
+              directory, counts = clone_host_runner(source)
+              print(f"Runner programs reused: version={source.name} {counts} seconds={time.monotonic() - started:.3f}", flush=True)
+              os.environ.update(EPHEMERAL_RUNNER_DIR=str(directory), EPHEMERAL_RUNNER_WORK=str(work))
 
-      - name: 配置并启动临时 runner（Unix）
-        if: runner.os != 'Windows' && inputs.jit_config == ''
-        run: |
-          cd "$EPHEMERAL_RUNNER_DIR"
-          if [ -n "$BOOTSTRAP_CALLBACK_SCRIPT" ]; then
-            python "$BOOTSTRAP_CALLBACK_SCRIPT" &
-            callback_pid=$!
-            trap 'wait "$callback_pid" || true' EXIT
-          fi
-          ./config.sh --unattended --ephemeral --replace \
-            --url "${{ inputs.target_url }}" \
-            --token "${{ inputs.reg_token }}" \
-            --name "${{ inputs.runner_name }}" \
-            --labels "${{ inputs.runner_labels }}" \
-            --work "$EPHEMERAL_RUNNER_WORK"
-          ./run.sh
+          def run_jit():
+              with open(os.environ["GITHUB_EVENT_PATH"], encoding="utf-8") as source:
+                  inputs = json.load(source)["inputs"]
+              if not inputs.get("jit_config"):
+                  return False
+              encoded = inputs["jit_config"]
+              print("::add-mask::" + encoded, flush=True)
+              bundle = json.loads(base64.b64decode(encoded))
+              if any("/" in name or "\\" in name or name in (".", "..") for name in bundle):
+                  raise ValueError("Invalid JIT configuration path")
+              settings = json.loads(base64.b64decode(bundle[".runner"]))
+              work_key = next(name for name in settings if name.lower() == "workfolder")
+              settings[work_key] = os.environ["EPHEMERAL_RUNNER_WORK"]
+              bundle[".runner"] = base64.b64encode(json.dumps(settings).encode()).decode()
+              encoded = base64.b64encode(json.dumps(bundle).encode()).decode()
+              print("::add-mask::" + encoded, flush=True)
+              directory = pathlib.Path(os.environ["EPHEMERAL_RUNNER_DIR"])
+              executable = directory / "bin" / ("Runner.Listener.exe" if os.name == "nt" else "Runner.Listener")
+              # 保留配置标记，启动失败时不会因为尚未生成 .runner 而误判为已经注销。
+              registration = directory / ".runner"
+              registration.write_bytes(base64.b64decode(bundle[".runner"]))
+              # Runner 读取后会移除该环境变量，配置不进入命令行、缓存或后续 job 的环境。
+              child_env = {**os.environ, "ACTIONS_RUNNER_INPUT_JITCONFIG": encoded}
+              print("JIT runner starting", flush=True)
+              result = subprocess.run([str(executable), "run"], cwd=directory, env=child_env)
+              # 部分托管版本完成一次性任务后返回 100；只有本地注册已删除时才接受它。
+              if result.returncode and not (result.returncode == 100 and not registration.exists()):
+                  sys.exit(result.returncode)
 
-      - name: 配置并启动临时 runner（Windows）
-        if: runner.os == 'Windows' && inputs.jit_config == ''
-        shell: python
-        run: |
-          import json, os, pathlib, runpy, subprocess, sys, threading
-          with open(os.environ["GITHUB_EVENT_PATH"], encoding="utf-8") as source:
-              inputs = json.load(source)["inputs"]
-          print("::add-mask::" + inputs["reg_token"], flush=True)
-          directory = pathlib.Path(os.environ["EPHEMERAL_RUNNER_DIR"])
-          if callback_script := os.environ.get("BOOTSTRAP_CALLBACK_SCRIPT"):
-              threading.Thread(target=runpy.run_path, args=(callback_script,)).start()
-          configured = subprocess.run(["cmd", "/d", "/c", "config.cmd", "--unattended", "--ephemeral", "--replace",
-              "--url", inputs["target_url"], "--token", inputs["reg_token"], "--name", inputs["runner_name"],
-              "--labels", inputs["runner_labels"], "--work", os.environ["EPHEMERAL_RUNNER_WORK"]], cwd=directory)
-          if configured.returncode:
-              sys.exit(configured.returncode)
-          # 内层 runner 会清理共享 _temp，cmd 会丢失尚未读完的外层脚本；Python 已加载脚本。
-          result = subprocess.run(["cmd", "/d", "/c", "run.cmd"], cwd=directory)
-          # 正常执行完一个 job 后 .runner 会被删除；尚未注销的异常退出仍须报错。
-          if result.returncode and (directory / ".runner").exists():
-              sys.exit(result.returncode)
+              return True
+
+          def run_legacy():
+              with open(os.environ["GITHUB_EVENT_PATH"], encoding="utf-8") as source:
+                  inputs = json.load(source)["inputs"]
+              print("::add-mask::" + inputs["reg_token"], flush=True)
+              directory = pathlib.Path(os.environ["EPHEMERAL_RUNNER_DIR"])
+              if os.name == "nt":
+                  configure = ["cmd", "/d", "/c", "config.cmd"]
+                  run = ["cmd", "/d", "/c", "run.cmd"]
+              else:
+                  configure = [str(directory / "config.sh")]
+                  run = [str(directory / "run.sh")]
+              configured = subprocess.run([*configure, "--unattended", "--ephemeral", "--replace",
+                  "--url", inputs["target_url"], "--token", inputs["reg_token"], "--name", inputs["runner_name"],
+                  "--labels", inputs["runner_labels"], "--work", os.environ["EPHEMERAL_RUNNER_WORK"]], cwd=directory)
+              if configured.returncode:
+                  sys.exit(configured.returncode)
+              # 内层 runner 会清理共享 _temp，cmd 会丢失尚未读完的外层脚本；Python 已加载脚本。
+              result = subprocess.run(run, cwd=directory)
+              # 正常执行完一个 job 后 .runner 会被删除；尚未注销的异常退出仍须报错。
+              if result.returncode and (directory / ".runner").exists():
+                  sys.exit(result.returncode)
+
+          def start_runner():
+              prepare_callback()
+              if callback_script := os.environ.get("BOOTSTRAP_CALLBACK_SCRIPT"):
+                  threading.Thread(target=runpy.run_path, args=(callback_script,)).start()
+              prepare_runner()
+              if not run_jit():
+                  run_legacy()
+
+          start_runner()
 
       - name: 通知调度器 bootstrap 已结束
         if: always() && inputs.callback_url != '' && inputs.callback_token != ''
         continue-on-error: true
         shell: python
+        env:
+          BOOTSTRAP_CALLBACK_URL: ${{ inputs.callback_url }}
+          BOOTSTRAP_CALLBACK_TOKEN: ${{ inputs.callback_token }}
+          BOOTSTRAP_CALLBACK_RUNNER_NAME: ${{ inputs.runner_name }}
         run: |
           import json, os, time, urllib.error, urllib.request
           token = os.environ["BOOTSTRAP_CALLBACK_TOKEN"]
