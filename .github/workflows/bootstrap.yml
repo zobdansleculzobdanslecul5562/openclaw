@@ -31,16 +31,6 @@ on:
         description: 以逗号分隔的 runner 标签
         required: true
         type: string
-      runner_version:
-        description: 无法复用托管 runner 时下载的 actions/runner 版本
-        required: false
-        default: '2.336.0'
-        type: string
-      reuse_host_runner:
-        description: 优先复用托管机器上的 runner 程序
-        required: false
-        default: true
-        type: boolean
       callback_url:
         description: 调度服务的状态回调地址
         required: false
@@ -99,13 +89,10 @@ jobs:
           with open(os.environ["GITHUB_ENV"], "a", encoding="utf-8") as target:
               target.write("BOOTSTRAP_CALLBACK_SCRIPT=" + str(callback_script) + "\n")
 
-      # 二进制目录与 --work 分开，缓存中只包含未注册的 runner。
+      # 仅复用托管机器上的程序文件，配置与凭据保存在独立目录。
       # 不能放进 RUNNER_TEMP：内层 runner 接活时会清空共享的 _temp。
       - name: 设置 runner 目录
-        id: prepare
         shell: python
-        env:
-          REUSE_HOST_RUNNER: ${{ inputs.reuse_host_runner }}
         run: |
           import os, pathlib, shutil, subprocess, tempfile, time
 
@@ -166,81 +153,16 @@ jobs:
 
           started = time.monotonic()
           work = pathlib.Path(os.environ["GITHUB_WORKSPACE"]).resolve().parent.parent
-          directory = work / ".ephemeral-runner"
-          ready = False
-          if (os.environ.get("REUSE_HOST_RUNNER", "true").lower() == "true"
-                  and os.environ.get("RUNNER_ENVIRONMENT") == "github-hosted"):
-              try:
-                  source = find_host_runner(os.environ["RUNNER_OS"])
-                  if source is not None:
-                      directory, counts = clone_host_runner(source)
-                      ready = True
-                      print(f"Runner programs reused: version={source.name} {counts} seconds={time.monotonic() - started:.3f}")
-              except (OSError, RuntimeError, ValueError, subprocess.SubprocessError) as error:
-                  print(f"Runner reuse unavailable ({type(error).__name__}); using package fallback")
+          if os.environ.get("RUNNER_ENVIRONMENT") != "github-hosted":
+              raise RuntimeError("Bootstrap requires a GitHub-hosted runner")
+          source = find_host_runner(os.environ["RUNNER_OS"])
+          if source is None:
+              raise RuntimeError("Could not locate the hosted Runner.Worker installation")
+          directory, counts = clone_host_runner(source)
+          print(f"Runner programs reused: version={source.name} {counts} seconds={time.monotonic() - started:.3f}")
           with open(os.environ["GITHUB_ENV"], "a", encoding="utf-8") as target:
               target.write(f"EPHEMERAL_RUNNER_DIR={directory}\n")
               target.write(f"EPHEMERAL_RUNNER_WORK={work}\n")
-          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as target:
-              target.write(f"ready={str(ready).lower()}\n")
-
-      # 按系统、架构和版本缓存解压后的文件，命中后直接注册，避免重复解压。
-      - name: 恢复 runner 文件缓存
-        if: steps.prepare.outputs.ready != 'true'
-        id: cache
-        uses: actions/cache/restore@v4
-        with:
-          path: ${{ env.EPHEMERAL_RUNNER_DIR }}
-          key: runner-files-v1-${{ runner.os }}-${{ runner.arch }}-${{ inputs.runner_version }}
-
-      - name: 下载 runner（Linux）
-        if: steps.prepare.outputs.ready != 'true' && runner.os == 'Linux' && steps.cache.outputs.cache-hit != 'true'
-        run: |
-          ARCH=x64
-          [ "${{ runner.arch }}" = "ARM64" ] && ARCH=arm64
-          mkdir -p runner-pkg
-          curl --fail --show-error --silent --location --retry 2 -o runner-pkg/actions-runner.tar.gz \
-            https://github.com/actions/runner/releases/download/v${{ inputs.runner_version }}/actions-runner-linux-${ARCH}-${{ inputs.runner_version }}.tar.gz
-
-      - name: 下载 runner（macOS）
-        if: steps.prepare.outputs.ready != 'true' && runner.os == 'macOS' && steps.cache.outputs.cache-hit != 'true'
-        run: |
-          ARCH=x64
-          [ "${{ runner.arch }}" = "ARM64" ] && ARCH=arm64
-          mkdir -p runner-pkg
-          curl --fail --show-error --silent --location --retry 2 -o runner-pkg/actions-runner.tar.gz \
-            https://github.com/actions/runner/releases/download/v${{ inputs.runner_version }}/actions-runner-osx-${ARCH}-${{ inputs.runner_version }}.tar.gz
-
-      - name: 下载 runner（Windows）
-        if: steps.prepare.outputs.ready != 'true' && runner.os == 'Windows' && steps.cache.outputs.cache-hit != 'true'
-        shell: pwsh
-        run: |
-          $arch = if ("${{ runner.arch }}" -eq "ARM64") { "arm64" } else { "x64" }
-          New-Item -ItemType Directory -Force -Path runner-pkg | Out-Null
-          Invoke-WebRequest -Uri "https://github.com/actions/runner/releases/download/v${{ inputs.runner_version }}/actions-runner-win-$arch-${{ inputs.runner_version }}.zip" -OutFile runner-pkg/actions-runner.zip
-
-      - name: 解压 runner（Unix）
-        if: steps.prepare.outputs.ready != 'true' && runner.os != 'Windows' && steps.cache.outputs.cache-hit != 'true'
-        run: |
-          mkdir -p "$EPHEMERAL_RUNNER_DIR"
-          tar xzf runner-pkg/actions-runner.tar.gz -C "$EPHEMERAL_RUNNER_DIR"
-
-      - name: 解压 runner（Windows）
-        if: steps.prepare.outputs.ready != 'true' && runner.os == 'Windows' && steps.cache.outputs.cache-hit != 'true'
-        shell: pwsh
-        run: |
-          New-Item -ItemType Directory -Force -Path $env:EPHEMERAL_RUNNER_DIR | Out-Null
-          tar -xf runner-pkg/actions-runner.zip -C "$env:EPHEMERAL_RUNNER_DIR"
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-
-      # 必须在注册前保存；注册后目录里会生成 .runner 和 .credentials 等凭据。
-      - name: 保存 runner 文件缓存
-        if: steps.prepare.outputs.ready != 'true' && steps.cache.outputs.cache-hit != 'true'
-        continue-on-error: true
-        uses: actions/cache/save@v4
-        with:
-          path: ${{ env.EPHEMERAL_RUNNER_DIR }}
-          key: ${{ steps.cache.outputs.cache-primary-key }}
 
       - name: 启动 JIT runner
         if: inputs.jit_config != ''
