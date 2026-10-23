@@ -71,7 +71,7 @@ jobs:
                       headers={"Authorization": "Bearer " + token, "Content-Type": "application/json",
                                "User-Agent": "self-hosted-runner-bootstrap"})
                   with urllib.request.urlopen(request, timeout=5) as response:
-                      print("bootstrap 状态已上报: HTTP", response.status)
+                      print("bootstrap callback status: HTTP", response.status)
                   break
               except (urllib.error.URLError, TimeoutError, OSError):
                   if attempt == 1:
@@ -194,7 +194,7 @@ jobs:
                       headers={"Authorization": "Bearer " + token, "Content-Type": "application/json",
                                "User-Agent": "self-hosted-runner-bootstrap"})
                   with urllib.request.urlopen(request, timeout=5) as response:
-                      print("bootstrap 状态已上报: HTTP", response.status)
+                      print("bootstrap callback status: HTTP", response.status)
                   break
               except (urllib.error.URLError, TimeoutError, OSError):
                   if attempt == 1:
