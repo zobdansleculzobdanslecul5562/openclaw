@@ -58,12 +58,12 @@ jobs:
     permissions:
       contents: read
     steps:
-      - name: 通知调度器 bootstrap 已启动
+      - name: 准备 bootstrap 回调
         if: inputs.callback_url != '' && inputs.callback_token != ''
         continue-on-error: true
         shell: python
         run: |
-          import json, os, time, urllib.error, urllib.request
+          import json, os, pathlib
           with open(os.environ["GITHUB_EVENT_PATH"], encoding="utf-8") as source:
               inputs = json.load(source)["inputs"]
           token = inputs["callback_token"]
@@ -74,11 +74,17 @@ jobs:
                                   "BOOTSTRAP_CALLBACK_TOKEN": token,
                                   "BOOTSTRAP_CALLBACK_RUNNER_NAME": inputs["runner_name"]}.items():
                   target.write(name + "=" + value + "\n")
-          body = json.dumps({"action": "started", "runnerName": inputs["runner_name"],
+          # 网络通知在启动 listener 时并行发送，不让 HTTP 重试阻塞目标任务接活。
+          # 放在共享 _temp 和 checkout 目录之外，避免内层 runner 清理这些目录。
+          callback_script = pathlib.Path(os.environ["GITHUB_WORKSPACE"]).resolve().parent.parent / (
+              ".bootstrap-callback-" + os.environ["GITHUB_RUN_ID"] + ".py")
+          callback_script.write_text("""import json, os, time, urllib.error, urllib.request
+          token = os.environ["BOOTSTRAP_CALLBACK_TOKEN"]
+          body = json.dumps({"action": "started", "runnerName": os.environ["BOOTSTRAP_CALLBACK_RUNNER_NAME"],
                              "runId": int(os.environ["GITHUB_RUN_ID"])}).encode()
           for attempt in range(2):
               try:
-                  request = urllib.request.Request(inputs["callback_url"], data=body, method="POST",
+                  request = urllib.request.Request(os.environ["BOOTSTRAP_CALLBACK_URL"], data=body, method="POST",
                       headers={"Authorization": "Bearer " + token, "Content-Type": "application/json",
                                "User-Agent": "self-hosted-runner-bootstrap"})
                   with urllib.request.urlopen(request, timeout=5) as response:
@@ -86,8 +92,12 @@ jobs:
                   break
               except (urllib.error.URLError, TimeoutError, OSError):
                   if attempt == 1:
-                      raise
+                      print("bootstrap started callback unavailable after two attempts", flush=True)
+                      break
                   time.sleep(1)
+          """, encoding="utf-8")
+          with open(os.environ["GITHUB_ENV"], "a", encoding="utf-8") as target:
+              target.write("BOOTSTRAP_CALLBACK_SCRIPT=" + str(callback_script) + "\n")
 
       # 二进制目录与 --work 分开，缓存中只包含未注册的 runner。
       # 不能放进 RUNNER_TEMP：内层 runner 接活时会清空共享的 _temp。
@@ -236,7 +246,7 @@ jobs:
         if: inputs.jit_config != ''
         shell: python
         run: |
-          import base64, json, os, pathlib, subprocess, sys
+          import base64, json, os, pathlib, runpy, subprocess, sys, threading
           with open(os.environ["GITHUB_EVENT_PATH"], encoding="utf-8") as source:
               inputs = json.load(source)["inputs"]
           encoded = inputs["jit_config"]
@@ -257,6 +267,8 @@ jobs:
           registration.write_bytes(base64.b64decode(bundle[".runner"]))
           # Runner 读取后会移除该环境变量，配置不进入命令行、缓存或后续 job 的环境。
           child_env = {**os.environ, "ACTIONS_RUNNER_INPUT_JITCONFIG": encoded}
+          if callback_script := os.environ.get("BOOTSTRAP_CALLBACK_SCRIPT"):
+              threading.Thread(target=runpy.run_path, args=(callback_script,)).start()
           result = subprocess.run([str(executable), "run"], cwd=directory, env=child_env)
           # 部分托管版本完成一次性任务后返回 100；只有本地注册已删除时才接受它。
           if result.returncode and not (result.returncode == 100 and not registration.exists()):
@@ -266,6 +278,11 @@ jobs:
         if: runner.os != 'Windows' && inputs.jit_config == ''
         run: |
           cd "$EPHEMERAL_RUNNER_DIR"
+          if [ -n "$BOOTSTRAP_CALLBACK_SCRIPT" ]; then
+            python "$BOOTSTRAP_CALLBACK_SCRIPT" &
+            callback_pid=$!
+            trap 'wait "$callback_pid" || true' EXIT
+          fi
           ./config.sh --unattended --ephemeral --replace \
             --url "${{ inputs.target_url }}" \
             --token "${{ inputs.reg_token }}" \
@@ -278,11 +295,13 @@ jobs:
         if: runner.os == 'Windows' && inputs.jit_config == ''
         shell: python
         run: |
-          import json, os, pathlib, subprocess, sys
+          import json, os, pathlib, runpy, subprocess, sys, threading
           with open(os.environ["GITHUB_EVENT_PATH"], encoding="utf-8") as source:
               inputs = json.load(source)["inputs"]
           print("::add-mask::" + inputs["reg_token"], flush=True)
           directory = pathlib.Path(os.environ["EPHEMERAL_RUNNER_DIR"])
+          if callback_script := os.environ.get("BOOTSTRAP_CALLBACK_SCRIPT"):
+              threading.Thread(target=runpy.run_path, args=(callback_script,)).start()
           configured = subprocess.run(["cmd", "/d", "/c", "config.cmd", "--unattended", "--ephemeral", "--replace",
               "--url", inputs["target_url"], "--token", inputs["reg_token"], "--name", inputs["runner_name"],
               "--labels", inputs["runner_labels"], "--work", os.environ["EPHEMERAL_RUNNER_WORK"]], cwd=directory)
