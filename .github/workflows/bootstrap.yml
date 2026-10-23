@@ -77,13 +77,24 @@ jobs:
                       raise
                   time.sleep(1)
 
-      # 按系统、架构和版本缓存压缩包，命中后跳过 GitHub Releases 下载
-      - name: 恢复 runner 安装包缓存
+      # 二进制目录与 --work 分开，缓存中只包含未注册的 runner。
+      # 不能放进 RUNNER_TEMP：内层 runner 接活时会清空共享的 _temp。
+      - name: 设置 runner 目录
+        shell: python
+        run: |
+          import os, pathlib
+          work = pathlib.Path(os.environ["GITHUB_WORKSPACE"]).resolve().parent.parent
+          with open(os.environ["GITHUB_ENV"], "a", encoding="utf-8") as target:
+              target.write(f"EPHEMERAL_RUNNER_DIR={work / '.ephemeral-runner'}\n")
+              target.write(f"EPHEMERAL_RUNNER_WORK={work}\n")
+
+      # 按系统、架构和版本缓存解压后的文件，命中后直接注册，避免重复解压。
+      - name: 恢复 runner 文件缓存
         id: cache
         uses: actions/cache/restore@v4
         with:
-          path: runner-pkg
-          key: runner-${{ runner.os }}-${{ runner.arch }}-${{ inputs.runner_version }}
+          path: ${{ env.EPHEMERAL_RUNNER_DIR }}
+          key: runner-files-v1-${{ runner.os }}-${{ runner.arch }}-${{ inputs.runner_version }}
 
       - name: 下载 runner（Linux）
         if: runner.os == 'Linux' && steps.cache.outputs.cache-hit != 'true'
@@ -91,7 +102,7 @@ jobs:
           ARCH=x64
           [ "${{ runner.arch }}" = "ARM64" ] && ARCH=arm64
           mkdir -p runner-pkg
-          curl -o runner-pkg/actions-runner.tar.gz -L \
+          curl --fail --show-error --silent --location --retry 2 -o runner-pkg/actions-runner.tar.gz \
             https://github.com/actions/runner/releases/download/v${{ inputs.runner_version }}/actions-runner-linux-${ARCH}-${{ inputs.runner_version }}.tar.gz
 
       - name: 下载 runner（macOS）
@@ -100,7 +111,7 @@ jobs:
           ARCH=x64
           [ "${{ runner.arch }}" = "ARM64" ] && ARCH=arm64
           mkdir -p runner-pkg
-          curl -o runner-pkg/actions-runner.tar.gz -L \
+          curl --fail --show-error --silent --location --retry 2 -o runner-pkg/actions-runner.tar.gz \
             https://github.com/actions/runner/releases/download/v${{ inputs.runner_version }}/actions-runner-osx-${ARCH}-${{ inputs.runner_version }}.tar.gz
 
       - name: 下载 runner（Windows）
@@ -111,29 +122,28 @@ jobs:
           New-Item -ItemType Directory -Force -Path runner-pkg | Out-Null
           Invoke-WebRequest -Uri "https://github.com/actions/runner/releases/download/v${{ inputs.runner_version }}/actions-runner-win-$arch-${{ inputs.runner_version }}.zip" -OutFile runner-pkg/actions-runner.zip
 
-      - name: 保存 runner 安装包缓存
-        if: steps.cache.outputs.cache-hit != 'true'
-        uses: actions/cache/save@v4
-        with:
-          path: runner-pkg
-          key: runner-${{ runner.os }}-${{ runner.arch }}-${{ inputs.runner_version }}
-
-      # 从 GITHUB_WORKSPACE 向上两层得到托管工作根目录；--work 指向这里，
-      # 目标任务会按派发仓库名铺成 <repo>/<repo>，与 GitHub 托管一致
       - name: 解压 runner（Unix）
-        if: runner.os != 'Windows'
+        if: runner.os != 'Windows' && steps.cache.outputs.cache-hit != 'true'
         run: |
-          dir="$(cd "$GITHUB_WORKSPACE/../.." && pwd)"
-          tar xzf runner-pkg/actions-runner.tar.gz -C "$dir"
-          echo "EPHEMERAL_RUNNER_DIR=$dir" >> "$GITHUB_ENV"
+          mkdir -p "$EPHEMERAL_RUNNER_DIR"
+          tar xzf runner-pkg/actions-runner.tar.gz -C "$EPHEMERAL_RUNNER_DIR"
 
       - name: 解压 runner（Windows）
-        if: runner.os == 'Windows'
+        if: runner.os == 'Windows' && steps.cache.outputs.cache-hit != 'true'
         shell: pwsh
         run: |
-          $dir = [IO.Path]::GetFullPath((Join-Path $env:GITHUB_WORKSPACE '..\..'))
-          Expand-Archive -Path runner-pkg/actions-runner.zip -DestinationPath $dir -Force
-          Add-Content -Path $env:GITHUB_ENV -Value "EPHEMERAL_RUNNER_DIR=$dir"
+          New-Item -ItemType Directory -Force -Path $env:EPHEMERAL_RUNNER_DIR | Out-Null
+          tar -xf runner-pkg/actions-runner.zip -C "$env:EPHEMERAL_RUNNER_DIR"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      # 必须在注册前保存；注册后目录里会生成 .runner 和 .credentials 等凭据。
+      - name: 保存 runner 文件缓存
+        if: steps.cache.outputs.cache-hit != 'true'
+        continue-on-error: true
+        uses: actions/cache/save@v4
+        with:
+          path: ${{ env.EPHEMERAL_RUNNER_DIR }}
+          key: ${{ steps.cache.outputs.cache-primary-key }}
 
       - name: 配置并启动临时 runner（Unix）
         if: runner.os != 'Windows'
@@ -144,7 +154,7 @@ jobs:
             --token "${{ inputs.reg_token }}" \
             --name "${{ inputs.runner_name }}" \
             --labels "${{ inputs.runner_labels }}" \
-            --work "$EPHEMERAL_RUNNER_DIR"
+            --work "$EPHEMERAL_RUNNER_WORK"
           ./run.sh
 
       - name: 配置并启动临时 runner（Windows）
@@ -153,7 +163,7 @@ jobs:
         run: |
           cd /d "%EPHEMERAL_RUNNER_DIR%"
           if errorlevel 1 exit /b 1
-          call config.cmd --unattended --ephemeral --replace --url "${{ inputs.target_url }}" --token "${{ inputs.reg_token }}" --name "${{ inputs.runner_name }}" --labels "${{ inputs.runner_labels }}" --work "%EPHEMERAL_RUNNER_DIR%"
+          call config.cmd --unattended --ephemeral --replace --url "${{ inputs.target_url }}" --token "${{ inputs.reg_token }}" --name "${{ inputs.runner_name }}" --labels "${{ inputs.runner_labels }}" --work "%EPHEMERAL_RUNNER_WORK%"
           if errorlevel 1 exit /b 1
           call run.cmd
           rem 临时 runner 跑完任务会自动注销并删掉 .runner，run.cmd 随后以非零码退出
