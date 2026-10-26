@@ -48,13 +48,14 @@ jobs:
     permissions:
       contents: read
     steps:
-      # 准备（找托管 runner、复制程序、处理 JIT 配置或注册）用 Python，准备完就退出；常驻等待内层 runner 的是下一步的 pwsh。
+      # 准备（找托管 runner、复制程序、处理 JIT 配置或注册）用 Python，准备完就退出；常驻等待内层 runner 的是下一步
+      # （Windows 用 pwsh，Linux、macOS 用 bash）。
       # 不让 Python 常驻：云电脑等目标机上，用户按名字结束所有 python（taskkill /im python.exe）是常见操作，
       # 结束了这个步骤进程，外层 job 随即结束并清理孤儿进程，内层 runner 连同它正在跑的 job 一起没了，约 10 分钟后被判失联。
       - name: 准备临时 runner
         shell: python
         run: |
-          import base64, json, os, pathlib, shutil, subprocess, sys, tempfile, textwrap, time
+          import base64, json, os, pathlib, shlex, shutil, subprocess, sys, tempfile, textwrap, time
 
           print("Bootstrap process started", flush=True)
 
@@ -230,14 +231,22 @@ jobs:
               write_launch({"mode": "legacy", "command": run, "cwd": str(directory),
                             "registration": str(directory / ".runner")})
 
+          def launch_text(spec, windows):
+              # Windows 给 pwsh 读 JSON；Linux、macOS 给 bash 直接 source，值都经 shlex.quote，不依赖 jq 也不再起 Python。
+              if windows:
+                  return json.dumps(spec)
+              lines = [f"{key}={shlex.quote(spec[key])}" for key in ("mode", "cwd", "registration", "jit") if key in spec]
+              lines.append("command=(" + " ".join(shlex.quote(part) for part in spec["command"]) + ")")
+              return "\n".join(lines) + "\n"
+
           def launch_path():
               # 放在共享 _temp 和 checkout 目录之外，内层 runner 清理不到；下一步读出后立刻删除。
               work = pathlib.Path(os.environ["GITHUB_WORKSPACE"]).resolve().parent.parent
-              return work / (".bootstrap-launch-" + os.environ["GITHUB_RUN_ID"] + ".json")
+              return work / (".bootstrap-launch-" + os.environ["GITHUB_RUN_ID"] + (".json" if os.name == "nt" else ".sh"))
 
           def write_launch(spec):
               target = launch_path()
-              target.write_text(json.dumps(spec), encoding="utf-8")
+              target.write_text(launch_text(spec, os.name == "nt"), encoding="utf-8")
               if os.name != "nt":
                   target.chmod(0o600)
 
@@ -253,7 +262,8 @@ jobs:
 
           start_runner()
 
-      - name: 启动临时 runner
+      - name: 启动临时 runner（Windows）
+        if: runner.os == 'Windows'
         shell: pwsh
         run: |
           # pwsh 先读完整个脚本再执行，内层 runner 清理共享 _temp 时不会像 cmd 那样丢掉没读完的部分。
@@ -278,6 +288,33 @@ jobs:
           # 注册令牌：正常执行完一个 job 后 .runner 会被删除，尚未注销的异常退出仍须报错。
           if ($launch.mode -eq 'jit') { if ($code -and -not ($code -eq 100 -and -not $registered)) { exit $code } }
           elseif ($code -and $registered) { exit $code }
+          exit 0
+
+      - name: 启动临时 runner
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          # 内层 runner 清理共享 _temp 时会删掉本脚本；Linux、macOS 上已打开的文件删掉后照样能读完。
+          work="$(cd "$GITHUB_WORKSPACE/../.." && pwd)"
+          launch_file="$work/.bootstrap-launch-$GITHUB_RUN_ID.sh"
+          . "$launch_file"
+          rm -f "$launch_file"
+          echo "Runner starting: $mode"
+          cd "$cwd"
+          code=0
+          if [ -n "${jit:-}" ]; then
+            ACTIONS_RUNNER_INPUT_JITCONFIG="$jit" "${command[@]}" || code=$?
+          else
+            "${command[@]}" || code=$?
+          fi
+          unset jit
+          # JIT：部分托管版本完成一次性任务后返回 100，只有本地注册已删除时才接受它。
+          # 注册令牌：正常执行完一个 job 后 .runner 会被删除，尚未注销的异常退出仍须报错。
+          if [ "$mode" = jit ]; then
+            if [ "$code" -ne 0 ] && ! { [ "$code" -eq 100 ] && [ ! -e "$registration" ]; }; then exit "$code"; fi
+          elif [ "$code" -ne 0 ] && [ -e "$registration" ]; then
+            exit "$code"
+          fi
           exit 0
 
       - name: 通知调度器 bootstrap 已结束
