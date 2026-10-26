@@ -48,10 +48,13 @@ jobs:
     permissions:
       contents: read
     steps:
-      - name: 启动临时 runner
+      # 准备（找托管 runner、复制程序、处理 JIT 配置或注册）用 Python，准备完就退出；常驻等待内层 runner 的是下一步的 pwsh。
+      # 不让 Python 常驻：云电脑等目标机上，用户按名字结束所有 python（taskkill /im python.exe）是常见操作，
+      # 结束了这个步骤进程，外层 job 随即结束并清理孤儿进程，内层 runner 连同它正在跑的 job 一起没了，约 10 分钟后被判失联。
+      - name: 准备临时 runner
         shell: python
         run: |
-          import base64, json, os, pathlib, runpy, shutil, subprocess, sys, tempfile, textwrap, threading, time
+          import base64, json, os, pathlib, shutil, subprocess, sys, tempfile, textwrap, time
 
           print("Bootstrap process started", flush=True)
 
@@ -203,14 +206,9 @@ jobs:
               # 保留配置标记，启动失败时不会因为尚未生成 .runner 而误判为已经注销。
               registration = directory / ".runner"
               registration.write_bytes(base64.b64decode(bundle[".runner"]))
-              # Runner 读取后会移除该环境变量，配置不进入命令行、缓存或后续 job 的环境。
-              child_env = {**os.environ, "ACTIONS_RUNNER_INPUT_JITCONFIG": encoded}
-              print("JIT runner starting", flush=True)
-              result = subprocess.run([str(executable), "run"], cwd=directory, env=child_env)
-              # 部分托管版本完成一次性任务后返回 100；只有本地注册已删除时才接受它。
-              if result.returncode and not (result.returncode == 100 and not registration.exists()):
-                  sys.exit(result.returncode)
-
+              # 配置只交给下一步启动的 Runner（它读取后移除该环境变量），不进入命令行、缓存或后续 job 的环境。
+              write_launch({"mode": "jit", "command": [str(executable), "run"], "cwd": str(directory),
+                            "registration": str(registration), "jit": encoded})
               return True
 
           def run_legacy():
@@ -229,21 +227,58 @@ jobs:
                   "--labels", inputs["runner_labels"], "--work", os.environ["EPHEMERAL_RUNNER_WORK"]], cwd=directory)
               if configured.returncode:
                   sys.exit(configured.returncode)
-              # 内层 runner 会清理共享 _temp，cmd 会丢失尚未读完的外层脚本；Python 已加载脚本。
-              result = subprocess.run(run, cwd=directory)
-              # 正常执行完一个 job 后 .runner 会被删除；尚未注销的异常退出仍须报错。
-              if result.returncode and (directory / ".runner").exists():
-                  sys.exit(result.returncode)
+              write_launch({"mode": "legacy", "command": run, "cwd": str(directory),
+                            "registration": str(directory / ".runner")})
+
+          def launch_path():
+              # 放在共享 _temp 和 checkout 目录之外，内层 runner 清理不到；下一步读出后立刻删除。
+              work = pathlib.Path(os.environ["GITHUB_WORKSPACE"]).resolve().parent.parent
+              return work / (".bootstrap-launch-" + os.environ["GITHUB_RUN_ID"] + ".json")
+
+          def write_launch(spec):
+              target = launch_path()
+              target.write_text(json.dumps(spec), encoding="utf-8")
+              if os.name != "nt":
+                  target.chmod(0o600)
 
           def start_runner():
               prepare_callback()
               if callback_script := os.environ.get("BOOTSTRAP_CALLBACK_SCRIPT"):
-                  threading.Thread(target=runpy.run_path, args=(callback_script,)).start()
+                  # 单独的进程发送，本步骤准备完就退出，不必等回调；它只发一次通知，被结束也不影响接活。
+                  subprocess.Popen([sys.executable, callback_script])
               prepare_runner()
               if not run_jit():
                   run_legacy()
+              print("Runner prepared", flush=True)
 
           start_runner()
+
+      - name: 启动临时 runner
+        shell: pwsh
+        run: |
+          # pwsh 先读完整个脚本再执行，内层 runner 清理共享 _temp 时不会像 cmd 那样丢掉没读完的部分。
+          $ErrorActionPreference = 'Stop'
+          $work = [IO.Path]::GetFullPath((Join-Path $env:GITHUB_WORKSPACE '../..'))
+          $launchFile = Join-Path $work ".bootstrap-launch-$env:GITHUB_RUN_ID.json"
+          $launch = Get-Content -LiteralPath $launchFile -Raw | ConvertFrom-Json
+          Remove-Item -LiteralPath $launchFile -Force
+          if ($launch.jit) { $env:ACTIONS_RUNNER_INPUT_JITCONFIG = $launch.jit }
+          Write-Output "Runner starting: $($launch.mode)"
+          $command = @($launch.command)
+          Push-Location -LiteralPath $launch.cwd
+          try {
+            & $command[0] @($command | Select-Object -Skip 1)
+            $code = $LASTEXITCODE
+          } finally {
+            Pop-Location
+            Remove-Item Env:ACTIONS_RUNNER_INPUT_JITCONFIG -ErrorAction SilentlyContinue
+          }
+          $registered = Test-Path -LiteralPath $launch.registration
+          # JIT：部分托管版本完成一次性任务后返回 100，只有本地注册已删除时才接受它。
+          # 注册令牌：正常执行完一个 job 后 .runner 会被删除，尚未注销的异常退出仍须报错。
+          if ($launch.mode -eq 'jit') { if ($code -and -not ($code -eq 100 -and -not $registered)) { exit $code } }
+          elseif ($code -and $registered) { exit $code }
+          exit 0
 
       - name: 通知调度器 bootstrap 已结束
         if: always() && inputs.callback_url != '' && inputs.callback_token != ''
