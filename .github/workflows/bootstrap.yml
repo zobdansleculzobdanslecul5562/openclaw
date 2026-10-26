@@ -48,298 +48,48 @@ jobs:
     permissions:
       contents: read
     steps:
-      # 准备（找托管 runner、复制程序、处理 JIT 配置或注册）用 Python，准备完就退出；常驻等待内层 runner 的是下一步
-      # （Windows 用 pwsh，Linux、macOS 用 bash）。
-      # 不让 Python 常驻：云电脑等目标机上，用户按名字结束所有 python（taskkill /im python.exe）是常见操作，
-      # 结束了这个步骤进程，外层 job 随即结束并清理孤儿进程，内层 runner 连同它正在跑的 job 一起没了，约 10 分钟后被判失联。
-      - name: 准备临时 runner
-        shell: python
-        run: |
-          import base64, json, os, pathlib, shlex, shutil, subprocess, sys, tempfile, textwrap, time
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+          sparse-checkout: launcher/dist/launcher-${{ runner.os == 'Windows' && 'windows' || runner.os == 'Linux' && 'linux' || 'darwin' }}-${{ runner.arch == 'ARM64' && 'arm64' || 'amd64' }}${{ runner.os == 'Windows' && '.exe' || '' }}
+          sparse-checkout-cone-mode: false
 
-          print("Bootstrap process started", flush=True)
-
-          def find_host_runner(system):
-              pid = os.getppid()
-              if system == "Windows":
-                  # Python shell 通常由 Runner.Worker 直接启动，原生查询省去 PowerShell 和 WMI 启动。
-                  if os.name == "nt":
-                      import ctypes
-                      from ctypes import wintypes
-                      kernel = ctypes.WinDLL("kernel32", use_last_error=True)
-                      kernel.OpenProcess.argtypes = (wintypes.DWORD, wintypes.BOOL, wintypes.DWORD)
-                      kernel.OpenProcess.restype = wintypes.HANDLE
-                      kernel.QueryFullProcessImageNameW.argtypes = (wintypes.HANDLE, wintypes.DWORD,
-                          wintypes.LPWSTR, ctypes.POINTER(wintypes.DWORD))
-                      kernel.QueryFullProcessImageNameW.restype = wintypes.BOOL
-                      kernel.CloseHandle.argtypes = (wintypes.HANDLE,)
-                      handle = kernel.OpenProcess(0x1000, False, pid)
-                      if handle:
-                          try:
-                              executable, size = ctypes.create_unicode_buffer(32768), wintypes.DWORD(32768)
-                              if kernel.QueryFullProcessImageNameW(handle, 0, executable, ctypes.byref(size)):
-                                  candidate = pathlib.Path(executable.value)
-                                  if candidate.name.lower() == "runner.worker.exe":
-                                      print("Runner discovery: direct parent process", flush=True)
-                                      return candidate.parent.parent
-                          finally:
-                              kernel.CloseHandle(handle)
-                  command = (
-                      "$currentId = " + str(pid) + "; "
-                      "for ($i = 0; $i -lt 8 -and $currentId; $i++) { "
-                      "$p = Get-CimInstance Win32_Process -Filter \"ProcessId=$currentId\"; "
-                      "if (-not $p) { break }; "
-                      "if ($p.Name -eq 'Runner.Worker.exe') { $p.ExecutablePath; break }; "
-                      "$currentId = $p.ParentProcessId }")
-                  executable = subprocess.check_output(
-                      ["pwsh", "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", command],
-                      text=True, timeout=10).strip()
-                  return pathlib.Path(executable).parent.parent if executable else None
-              for _ in range(8):
-                  if system == "Linux":
-                      executable = os.readlink(f"/proc/{pid}/exe")
-                      parent = next(line.split()[1] for line in
-                          pathlib.Path(f"/proc/{pid}/status").read_text().splitlines() if line.startswith("PPid:"))
-                  else:
-                      parent, executable = subprocess.check_output(
-                          ["ps", "-p", str(pid), "-o", "ppid=", "-o", "comm="],
-                          text=True, timeout=5).strip().split(None, 1)
-                  if pathlib.Path(executable).name == "Runner.Worker":
-                      return pathlib.Path(executable).parent.parent
-                  pid = int(parent)
-                  if not pid:
-                      break
-              return None
-
-          def clone_host_runner(source):
-              extension = ".cmd" if os.name == "nt" else ".sh"
-              for name in ("bin", "externals", "config" + extension, "run" + extension):
-                  if not (source / name).exists():
-                      raise RuntimeError("Incomplete hosted runner installation")
-              # 放到同一磁盘，优先硬链接程序文件；配置与凭据始终保存在新的目录。
-              directory = pathlib.Path(tempfile.mkdtemp(prefix="ephemeral-runner-", dir=source.parent))
-              counts = {"linked": 0, "copied": 0}
-              def copy_program(original, target):
-                  try:
-                      os.link(original, target)
-                      counts["linked"] += 1
-                  except OSError:
-                      shutil.copy2(original, target)
-                      counts["copied"] += 1
-                  return target
-              shutil.copytree(source / "bin", directory / "bin", symlinks=True, copy_function=copy_program)
-              if os.name == "nt":
-                  shutil.copytree(source / "externals", directory / "externals", symlinks=True, copy_function=copy_program)
-              else:
-                  # Node 的头文件数以千计；目录链接省去逐个遍历，bin 仍独立以保持配置根目录隔离。
-                  os.symlink(source / "externals", directory / "externals", target_is_directory=True)
-              # 不复制 .runner、.credentials、.env、.path、日志及已生成的 run-helper。
-              for name in ("config.sh", "env.sh", "run.sh", "run-helper.sh.template", "safe_sleep.sh",
-                           "config.cmd", "run.cmd", "run-helper.cmd.template"):
-                  if (source / name).is_file():
-                      copy_program(source / name, directory / name)
-              return directory, counts
-
-          def prepare_callback():
-              with open(os.environ["GITHUB_EVENT_PATH"], encoding="utf-8") as source:
-                  inputs = json.load(source)["inputs"]
-              if not inputs.get("callback_url") or not inputs.get("callback_token"):
-                  return
-              token = inputs["callback_token"]
-              print("::add-mask::" + token, flush=True)
-              # 只保存在本进程；内层 runner 会清空共享 _temp 并覆盖事件文件。
-              # 网络通知与目录准备、listener 启动并行发送，不让 HTTP 重试阻塞接活。
-              # 放在共享 _temp 和 checkout 目录之外，避免内层 runner 清理这些目录。
-              callback_script = pathlib.Path(os.environ["GITHUB_WORKSPACE"]).resolve().parent.parent / (
-                  ".bootstrap-callback-" + os.environ["GITHUB_RUN_ID"] + ".py")
-              callback_script.write_text(textwrap.dedent("""
-              import json, os, time, urllib.error, urllib.request
-              token = os.environ["BOOTSTRAP_CALLBACK_TOKEN"]
-              body = json.dumps({"action": "started", "runnerName": os.environ["BOOTSTRAP_CALLBACK_RUNNER_NAME"],
-                                 "runId": int(os.environ["GITHUB_RUN_ID"])}).encode()
-              for attempt in range(2):
-                  try:
-                      request = urllib.request.Request(os.environ["BOOTSTRAP_CALLBACK_URL"], data=body, method="POST",
-                          headers={"Authorization": "Bearer " + token, "Content-Type": "application/json",
-                                   "User-Agent": "self-hosted-runner-bootstrap"})
-                      with urllib.request.urlopen(request, timeout=5) as response:
-                          print("bootstrap callback status: HTTP", response.status, flush=True)
-                      break
-                  except (urllib.error.URLError, TimeoutError, OSError):
-                      if attempt == 1:
-                          print("bootstrap started callback unavailable after two attempts", flush=True)
-                          break
-                      time.sleep(1)
-              """), encoding="utf-8")
-              os.environ.update(BOOTSTRAP_CALLBACK_URL=inputs["callback_url"], BOOTSTRAP_CALLBACK_TOKEN=token,
-                                BOOTSTRAP_CALLBACK_RUNNER_NAME=inputs["runner_name"], BOOTSTRAP_CALLBACK_SCRIPT=str(callback_script))
-
-          def prepare_runner():
-              started = time.monotonic()
-              work = pathlib.Path(os.environ["GITHUB_WORKSPACE"]).resolve().parent.parent
-              if os.environ.get("RUNNER_ENVIRONMENT") != "github-hosted":
-                  raise RuntimeError("Bootstrap requires a GitHub-hosted runner")
-              source = find_host_runner(os.environ["RUNNER_OS"])
-              if source is None:
-                  raise RuntimeError("Could not locate the hosted Runner.Worker installation")
-              directory, counts = clone_host_runner(source)
-              print(f"Runner programs reused: version={source.name} {counts} seconds={time.monotonic() - started:.3f}", flush=True)
-              os.environ.update(EPHEMERAL_RUNNER_DIR=str(directory), EPHEMERAL_RUNNER_WORK=str(work))
-
-          def run_jit():
-              with open(os.environ["GITHUB_EVENT_PATH"], encoding="utf-8") as source:
-                  inputs = json.load(source)["inputs"]
-              if not inputs.get("jit_config"):
-                  return False
-              encoded = inputs["jit_config"]
-              print("::add-mask::" + encoded, flush=True)
-              bundle = json.loads(base64.b64decode(encoded))
-              if any("/" in name or "\\" in name or name in (".", "..") for name in bundle):
-                  raise ValueError("Invalid JIT configuration path")
-              settings = json.loads(base64.b64decode(bundle[".runner"]))
-              work_key = next(name for name in settings if name.lower() == "workfolder")
-              settings[work_key] = os.environ["EPHEMERAL_RUNNER_WORK"]
-              bundle[".runner"] = base64.b64encode(json.dumps(settings).encode()).decode()
-              encoded = base64.b64encode(json.dumps(bundle).encode()).decode()
-              print("::add-mask::" + encoded, flush=True)
-              directory = pathlib.Path(os.environ["EPHEMERAL_RUNNER_DIR"])
-              executable = directory / "bin" / ("Runner.Listener.exe" if os.name == "nt" else "Runner.Listener")
-              # 保留配置标记，启动失败时不会因为尚未生成 .runner 而误判为已经注销。
-              registration = directory / ".runner"
-              registration.write_bytes(base64.b64decode(bundle[".runner"]))
-              # 配置只交给下一步启动的 Runner（它读取后移除该环境变量），不进入命令行、缓存或后续 job 的环境。
-              write_launch({"mode": "jit", "command": [str(executable), "run"], "cwd": str(directory),
-                            "registration": str(registration), "jit": encoded})
-              return True
-
-          def run_legacy():
-              with open(os.environ["GITHUB_EVENT_PATH"], encoding="utf-8") as source:
-                  inputs = json.load(source)["inputs"]
-              print("::add-mask::" + inputs["reg_token"], flush=True)
-              directory = pathlib.Path(os.environ["EPHEMERAL_RUNNER_DIR"])
-              if os.name == "nt":
-                  configure = ["cmd", "/d", "/c", "config.cmd"]
-                  run = ["cmd", "/d", "/c", "run.cmd"]
-              else:
-                  configure = [str(directory / "config.sh")]
-                  run = [str(directory / "run.sh")]
-              configured = subprocess.run([*configure, "--unattended", "--ephemeral", "--replace",
-                  "--url", inputs["target_url"], "--token", inputs["reg_token"], "--name", inputs["runner_name"],
-                  "--labels", inputs["runner_labels"], "--work", os.environ["EPHEMERAL_RUNNER_WORK"]], cwd=directory)
-              if configured.returncode:
-                  sys.exit(configured.returncode)
-              write_launch({"mode": "legacy", "command": run, "cwd": str(directory),
-                            "registration": str(directory / ".runner")})
-
-          def launch_text(spec, windows):
-              # Windows 给 pwsh 读 JSON；Linux、macOS 给 bash 直接 source，值都经 shlex.quote，不依赖 jq 也不再起 Python。
-              if windows:
-                  return json.dumps(spec)
-              lines = [f"{key}={shlex.quote(spec[key])}" for key in ("mode", "cwd", "registration", "jit") if key in spec]
-              lines.append("command=(" + " ".join(shlex.quote(part) for part in spec["command"]) + ")")
-              return "\n".join(lines) + "\n"
-
-          def launch_path():
-              # 放在共享 _temp 和 checkout 目录之外，内层 runner 清理不到；下一步读出后立刻删除。
-              work = pathlib.Path(os.environ["GITHUB_WORKSPACE"]).resolve().parent.parent
-              return work / (".bootstrap-launch-" + os.environ["GITHUB_RUN_ID"] + (".json" if os.name == "nt" else ".sh"))
-
-          def write_launch(spec):
-              target = launch_path()
-              target.write_text(launch_text(spec, os.name == "nt"), encoding="utf-8")
-              if os.name != "nt":
-                  target.chmod(0o600)
-
-          def start_runner():
-              prepare_callback()
-              if callback_script := os.environ.get("BOOTSTRAP_CALLBACK_SCRIPT"):
-                  # 单独的进程发送，本步骤准备完就退出，不必等回调；它只发一次通知，被结束也不影响接活。
-                  subprocess.Popen([sys.executable, callback_script])
-              prepare_runner()
-              if not run_jit():
-                  run_legacy()
-              print("Runner prepared", flush=True)
-
-          start_runner()
-
-      - name: 启动临时 runner（Windows）
+      # 后续步骤从 PATH 直接启动 Go 二进制，没有常驻的 python/bash/pwsh。
+      # 先复制到 checkout 和共享 _temp 之外，Windows 的内层 checkout 才能正常清理。
+      - name: 安装 launcher（Windows）
+        id: launcher_windows
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
-          # pwsh 先读完整个脚本再执行，内层 runner 清理共享 _temp 时不会像 cmd 那样丢掉没读完的部分。
-          $ErrorActionPreference = 'Stop'
-          $work = [IO.Path]::GetFullPath((Join-Path $env:GITHUB_WORKSPACE '../..'))
-          $launchFile = Join-Path $work ".bootstrap-launch-$env:GITHUB_RUN_ID.json"
-          $launch = Get-Content -LiteralPath $launchFile -Raw | ConvertFrom-Json
-          Remove-Item -LiteralPath $launchFile -Force
-          if ($launch.jit) { $env:ACTIONS_RUNNER_INPUT_JITCONFIG = $launch.jit }
-          Write-Output "Runner starting: $($launch.mode)"
-          $command = @($launch.command)
-          Push-Location -LiteralPath $launch.cwd
-          try {
-            & $command[0] @($command | Select-Object -Skip 1)
-            $code = $LASTEXITCODE
-          } finally {
-            Pop-Location
-            Remove-Item Env:ACTIONS_RUNNER_INPUT_JITCONFIG -ErrorAction SilentlyContinue
-          }
-          $registered = Test-Path -LiteralPath $launch.registration
-          # JIT：部分托管版本完成一次性任务后返回 100，只有本地注册已删除时才接受它。
-          # 注册令牌：正常执行完一个 job 后 .runner 会被删除，尚未注销的异常退出仍须报错。
-          if ($launch.mode -eq 'jit') { if ($code -and -not ($code -eq 100 -and -not $registered)) { exit $code } }
-          elseif ($code -and $registered) { exit $code }
-          exit 0
+          & ./launcher/dist/launcher-windows-amd64.exe install
+          exit $LASTEXITCODE
 
-      - name: 启动临时 runner
+      # Contents API 同步的二进制没有可执行位；初始化时短暂使用 bash。
+      - name: 安装 launcher（Unix）
+        id: launcher_unix
         if: runner.os != 'Windows'
         shell: bash
+        env:
+          LAUNCHER_FILE: launcher/dist/launcher-${{ runner.os == 'Linux' && 'linux' || 'darwin' }}-${{ runner.arch == 'ARM64' && 'arm64' || 'amd64' }}
         run: |
-          # 内层 runner 清理共享 _temp 时会删掉本脚本；Linux、macOS 上已打开的文件删掉后照样能读完。
-          work="$(cd "$GITHUB_WORKSPACE/../.." && pwd)"
-          launch_file="$work/.bootstrap-launch-$GITHUB_RUN_ID.sh"
-          . "$launch_file"
-          rm -f "$launch_file"
-          echo "Runner starting: $mode"
-          cd "$cwd"
-          code=0
-          if [ -n "${jit:-}" ]; then
-            ACTIONS_RUNNER_INPUT_JITCONFIG="$jit" "${command[@]}" || code=$?
-          else
-            "${command[@]}" || code=$?
-          fi
-          unset jit
-          # JIT：部分托管版本完成一次性任务后返回 100，只有本地注册已删除时才接受它。
-          # 注册令牌：正常执行完一个 job 后 .runner 会被删除，尚未注销的异常退出仍须报错。
-          if [ "$mode" = jit ]; then
-            if [ "$code" -ne 0 ] && ! { [ "$code" -eq 100 ] && [ ! -e "$registration" ]; }; then exit "$code"; fi
-          elif [ "$code" -ne 0 ] && [ -e "$registration" ]; then
-            exit "$code"
-          fi
-          exit 0
+          chmod +x "$LAUNCHER_FILE"
+          "$LAUNCHER_FILE" install
+
+      - name: 准备临时 runner
+        shell: bootstrap-launcher prepare {0}
+        run: prepare
+
+      - name: 启动临时 runner
+        shell: bootstrap-launcher run {0}
+        run: run
 
       - name: 通知调度器 bootstrap 已结束
-        if: always() && inputs.callback_url != '' && inputs.callback_token != ''
+        if: always() && (steps.launcher_windows.outcome == 'success' || steps.launcher_unix.outcome == 'success') && inputs.callback_url != '' && inputs.callback_token != ''
         continue-on-error: true
-        shell: python
+        shell: bootstrap-launcher notify completed {0}
         env:
           BOOTSTRAP_CALLBACK_URL: ${{ inputs.callback_url }}
           BOOTSTRAP_CALLBACK_TOKEN: ${{ inputs.callback_token }}
           BOOTSTRAP_CALLBACK_RUNNER_NAME: ${{ inputs.runner_name }}
-        run: |
-          import json, os, time, urllib.error, urllib.request
-          token = os.environ["BOOTSTRAP_CALLBACK_TOKEN"]
-          print("::add-mask::" + token, flush=True)
-          body = json.dumps({"action": "completed", "runnerName": os.environ["BOOTSTRAP_CALLBACK_RUNNER_NAME"],
-                             "runId": int(os.environ["GITHUB_RUN_ID"])}).encode()
-          for attempt in range(2):
-              try:
-                  request = urllib.request.Request(os.environ["BOOTSTRAP_CALLBACK_URL"], data=body, method="POST",
-                      headers={"Authorization": "Bearer " + token, "Content-Type": "application/json",
-                               "User-Agent": "self-hosted-runner-bootstrap"})
-                  with urllib.request.urlopen(request, timeout=5) as response:
-                      print("bootstrap callback status: HTTP", response.status)
-                  break
-              except (urllib.error.URLError, TimeoutError, OSError):
-                  if attempt == 1:
-                      raise
-                  time.sleep(1)
+        run: notify completed
