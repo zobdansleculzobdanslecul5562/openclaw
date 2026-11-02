@@ -48,33 +48,37 @@ jobs:
     permissions:
       contents: read
     steps:
-      - uses: actions/checkout@v4
-        with:
-          ref: ${{ github.sha }}
-          persist-credentials: false
-          sparse-checkout: launcher/dist/launcher-${{ runner.os == 'Windows' && 'windows' || runner.os == 'Linux' && 'linux' || 'darwin' }}-${{ runner.arch == 'ARM64' && 'arm64' || 'amd64' }}${{ runner.os == 'Windows' && '.exe' || '' }}
-          sparse-checkout-cone-mode: false
-
+      # 用 Contents API 只下载当前平台的二进制到 _temp，不做 checkout，避免工作区留下 .git。
       # 后续步骤从 PATH 直接启动 Go 二进制，没有常驻的 python/bash/pwsh。
-      # 先复制到 checkout 和共享 _temp 之外，Windows 的内层 checkout 才能正常清理。
+      # 先复制到工作区和共享 _temp 之外，Windows 的内层 checkout 才能正常清理。
       - name: 安装 launcher（Windows）
         id: launcher_windows
         if: runner.os == 'Windows'
         shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          LAUNCHER_PATH: launcher/dist/launcher-windows-amd64.exe
         run: |
-          & ./launcher/dist/launcher-windows-amd64.exe install
+          $file = Join-Path $env:RUNNER_TEMP "bootstrap-launcher-$env:GITHUB_RUN_ID.exe"
+          & curl.exe -fsSL --retry 3 -H "Authorization: Bearer $env:GH_TOKEN" -H "Accept: application/vnd.github.raw" -o $file "$env:GITHUB_API_URL/repos/$env:GITHUB_REPOSITORY/contents/$env:LAUNCHER_PATH`?ref=$env:GITHUB_SHA"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          & $file install
           exit $LASTEXITCODE
 
-      # Contents API 同步的二进制没有可执行位；初始化时短暂使用 bash。
+      # 下载的文件没有可执行位；初始化时短暂使用 bash。
       - name: 安装 launcher（Unix）
         id: launcher_unix
         if: runner.os != 'Windows'
         shell: bash
         env:
-          LAUNCHER_FILE: launcher/dist/launcher-${{ runner.os == 'Linux' && 'linux' || 'darwin' }}-${{ runner.arch == 'ARM64' && 'arm64' || 'amd64' }}
+          GH_TOKEN: ${{ github.token }}
+          LAUNCHER_PATH: launcher/dist/launcher-${{ runner.os == 'Linux' && 'linux' || 'darwin' }}-${{ runner.arch == 'ARM64' && 'arm64' || 'amd64' }}
         run: |
-          chmod +x "$LAUNCHER_FILE"
-          "$LAUNCHER_FILE" install
+          file="$RUNNER_TEMP/bootstrap-launcher-$GITHUB_RUN_ID"
+          curl -fsSL --retry 3 -H "Authorization: Bearer $GH_TOKEN" -H "Accept: application/vnd.github.raw" \
+            -o "$file" "$GITHUB_API_URL/repos/$GITHUB_REPOSITORY/contents/$LAUNCHER_PATH?ref=$GITHUB_SHA"
+          chmod +x "$file"
+          "$file" install
 
       - name: 准备临时 runner
         shell: bootstrap-launcher prepare {0}
